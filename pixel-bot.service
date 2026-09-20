@@ -1,0 +1,27 @@
+[Unit]
+Description=Pixel Anonymous Chat Bot (aiogram 3 webhook)
+Documentation=https://github.com/your-repo/pixel-bot
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Run as a dedicated non-root user (create with: sudo useradd -r -s /usr/sbin/nologin pixelbot)
+User=pixelbot
+Group=pixelbot
+WorkingDirectory=/opt/pixel-bot
+EnvironmentFile=/opt/pixel-bot/.env
+ExecStart=/opt/pixel-bot/venv/bin/python /opt/pixel-bot/bot.py
+Restart=always
+RestartSec=5
+# Graceful shutdown
+KillSignal=SIGINT
+TimeoutStopSec=30
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
