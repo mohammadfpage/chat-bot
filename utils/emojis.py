@@ -16,6 +16,13 @@ For every UI icon we store a mapping:  keyword -> (fallback_unicode, premium_id)
 
 To upgrade to Premium emojis later you ONLY need to fill in the real
 premium IDs in ``PREMIUM_EMOJIS`` — the keyboard files never change.
+
+Every fallback must NAME AN ACTION or an OBJECT — ``✅`` for confirm, ``🗑️`` for
+delete, ``📊`` for stats. An abstract coloured circle is banned: it encodes a hue,
+which the reader still has to translate into a verb, and it renders as a blank or
+monochrome dot in several Telegram clients and in every light/dark theme that
+recolours emoji. "This button is green" is not information; "this button
+deletes" is.
 """
 
 from __future__ import annotations
@@ -29,24 +36,32 @@ from typing import Final
 PREMIUM_EMOJIS: Final[dict[str, tuple[str, str | None]]] = {
     # ── Navigation & main menu ────────────────────────────────────────
     "home": ("🏠", None),
-    "back": ("↩️", None),
+    "back": ("🔙", None),
+    "reply": ("↩️", None),
     "forward": ("➡️", None),
     "next": ("⏭️", None),
     "prev": ("⏮️", None),
     "menu": ("📃", None),
     "close": ("❌", None),
-    "cancel": ("🚫", None),
+    "cancel": ("❌", None),
     "search": ("🔍", None),
     "refresh": ("🔄", None),
+    "exchange": ("🔁", None),
 
     # ── Chat / anonymous chat ─────────────────────────────────────────
     "connect": ("🔗", None),
-    "disconnect": ("🔴", None),
+    "disconnect": ("🔌", None),
     "report": ("🛑", None),
     "queue": ("⏳", None),
     "chat": ("💬", None),
     "star": ("⭐", None),
     "blocks": ("🧱", None),
+    # Matching modes: the three buttons a user picks to be matched, named by
+    # what they ARE (a dice, a woman, a man) so the price list on the admin
+    # panel reads as the same three services the users see.
+    "dice": ("🎲", None),
+    "female": ("👩", None),
+    "male": ("👨", None),
 
     # ── User profile & account ────────────────────────────────────────
     "profile": ("👤", None),
@@ -62,7 +77,8 @@ PREMIUM_EMOJIS: Final[dict[str, tuple[str, str | None]]] = {
     "balance": ("💰", None),
 
     # ── Help & info ───────────────────────────────────────────────────
-    "help": ("📋", None),
+    "help": ("📖", None),
+    "guide": ("📖", None),
     "rules": ("📜", None),
     "info": ("ℹ️", None),
     "question": ("❓", None),
@@ -143,6 +159,7 @@ PREMIUM_EMOJIS: Final[dict[str, tuple[str, str | None]]] = {
     "pin": ("📌", None),
     "bell": ("🔔", None),
     "eye": ("👁️", None),
+    "show": ("👁️", None),
     "magnet": ("🧲", None),
     "key": ("🔑", None),
     "camera": ("📷", None),

@@ -1,8 +1,11 @@
 [Unit]
-Description=Pixel Anonymous Chat Bot (aiogram 3 webhook)
-Documentation=https://github.com/your-repo/pixel-bot
-After=network-online.target postgresql.service
+Description=Anonymous Chat Bot (aiogram 3, long polling, SQLite)
+After=network-online.target
 Wants=network-online.target
+# A config/token error makes the bot exit within seconds; without a limit
+# systemd would restart it in a tight loop and bury the real error in journald.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -14,7 +17,7 @@ EnvironmentFile=/opt/pixel-bot/.env
 ExecStart=/opt/pixel-bot/venv/bin/python /opt/pixel-bot/bot.py
 Restart=always
 RestartSec=5
-# Graceful shutdown
+# Graceful shutdown (bot.py closes the session, disposes the engine, flushes WAL)
 KillSignal=SIGINT
 TimeoutStopSec=30
 # Hardening

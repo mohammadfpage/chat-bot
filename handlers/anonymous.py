@@ -12,8 +12,10 @@ Flow:
 
 import logging
 from collections import defaultdict
+from html import escape
 
 from aiogram import Router, F
+from aiogram.enums import ChatType
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import BaseStorage, StorageKey
 from aiogram.types import CallbackQuery, Message
@@ -22,11 +24,46 @@ from sqlalchemy import select, func as sql_func
 from database import async_session_factory, AnonymousMessage, BlockList
 from keyboards import main_menu_kb, anonymous_chat_menu_kb, unread_inbox_kb
 from states import AnonChatStates, ChatState
+from utils.economy import (
+    authorize_chat_message,
+    get_policy,
+    rate_limit_text,
+    should_warn,
+)
 
 logger = logging.getLogger(__name__)
 router = Router()
 
+# The inbox, guest list and session flow are private-chat only — none of them
+# may post menus or cards into a group.
+router.message.filter(F.chat.type == ChatType.PRIVATE)
+
 MAX_UNREAD_MESSAGES = 10
+
+
+def _card(callback: CallbackQuery) -> Message | None:
+    """The tapped card when it is still a usable :class:`Message`.
+
+    ``callback.message`` is ``None`` once the card has been deleted, and an
+    ``InaccessibleMessage`` when Telegram refuses to hand the message back
+    (inline mode, very old messages). Neither supports ``edit_text``, and a
+    bare ``callback.message.answer`` on them raises — every call site in this
+    module used to assume a live ``Message``.
+    """
+    msg = callback.message
+    return msg if isinstance(msg, Message) else None
+
+
+async def _fallback(callback: CallbackQuery, text: str, **kwargs) -> None:
+    """Deliver ``text`` when the tapped card no longer exists.
+
+    The callback itself cannot carry a message, so the answer goes to the
+    user's private chat — which is where all of these handlers run anyway.
+    """
+    try:
+        await callback.bot.send_message(callback.from_user.id, text, **kwargs)
+    except Exception as exc:
+        logger.debug("Could not deliver fallback message: %s", exc)
 
 
 # ──────────────────────────────────────────────────
@@ -125,7 +162,7 @@ async def handle_deep_link_anon(
 # 2. Show Inbox (grouped by sender)
 # ──────────────────────────────────────────────────
 
-@router.message(F.text == "📬 پیام‌های ناشناس من")
+@router.message(F.text == "📩 پیام‌های ناشناس من")
 async def show_inbox(message: Message, state: FSMContext) -> None:
     """Show inbox with guests who sent unread messages."""
     user_id = message.from_user.id
@@ -201,14 +238,22 @@ async def cb_open_anon_conversation(
 
     if not messages:
         await callback.answer("📭 پیام جدیدی وجود ندارد.", show_alert=True)
-        try:
-            await callback.message.edit_text("📭 صندوق شما خالی است.")
-        except Exception:
-            pass
-        await callback.message.answer(
-            "منوی اصلی:",
-            reply_markup=main_menu_kb(),
-        )
+        card = _card(callback)
+        if card is not None:
+            try:
+                # The keyboard travels on edit_text — answerCallbackQuery has
+                # no keyboard field, so a reply_markup= there is silently dead.
+                await card.edit_text(
+                    "📭 صندوق شما خالی است.", reply_markup=main_menu_kb()
+                )
+            except Exception:
+                try:
+                    await card.edit_reply_markup(reply_markup=main_menu_kb())
+                except Exception:
+                    pass
+            await card.answer("منوی اصلی:")
+        else:
+            await _fallback(callback, "منوی اصلی:", reply_markup=main_menu_kb())
         return
 
     # Mark all messages as read
@@ -217,15 +262,28 @@ async def cb_open_anon_conversation(
             msg.is_read = True
         await session.commit()
 
-    # Send all unread messages to the owner
-    await callback.message.edit_text(
-        f"📩 <b>پیام‌های ناشناس از کاربر {sender_id}:</b>\n\n"
-        "——————————————",
-        parse_mode="HTML",
+    # Send all unread messages to the owner. The sender is named by POSITION in
+    # the inbox («کاربر ۱») and by nothing else — printing their id here would
+    # contradict the entire point of the inbox being anonymous.
+    header = (
+        "📩 <b>پیام‌های ناشناس دریافت‌شده:</b>\n\n"
+        "——————————————"
     )
-
-    for msg in messages:
-        await callback.message.answer(f"💬 {msg.content}")
+    card = _card(callback)
+    if card is None:
+        # The card is gone — keep the flow alive by writing to the PM.
+        await _fallback(callback, header, parse_mode="HTML")
+        for msg in messages:
+            # _fallback writes with the global HTML parse mode — unescaped
+            # user content (a stray "<") would make the whole send fail.
+            await _fallback(callback, f"💬 {escape(msg.content)}")
+    else:
+        try:
+            await card.edit_text(header, parse_mode="HTML")
+        except Exception:
+            pass
+        for msg in messages:
+            await card.answer(f"💬 {msg.content}")
 
     # Check if guest is currently online (in session with us)
     is_guest_online = await _is_partner_online(
@@ -233,16 +291,29 @@ async def cb_open_anon_conversation(
     )
 
     if is_guest_online:
-        await callback.message.answer(
-            "🟢 <b>مخاطب شما آنلاین است! پیام‌های شما مستقیماً ارسال می‌شوند.</b>",
-            parse_mode="HTML",
-            reply_markup=anonymous_chat_menu_kb(),
+        online_text = (
+            "✅ <b>مخاطب شما آنلاین است! پیام‌های شما مستقیماً ارسال می‌شوند.</b>"
         )
     else:
-        await callback.message.answer(
-            "🔴 <b>مخاطب شما آفلاین است.</b>\n"
-            "پیام‌های شما ذخیره شده و مخاطب پس از بازدید پاسخ خواهد داد.",
-            parse_mode="HTML",
+        online_text = (
+            "⏳ <b>مخاطب شما آفلاین است.</b>\n"
+            "پیام‌های شما ذخیره شده و مخاطب پس از بازدید پاسخ خواهد داد."
+        )
+    # answerCallbackQuery never renders HTML — the toast gets a tag-free twin,
+    # otherwise the user reads literal "<b>" in the alert. It also has no
+    # keyboard field, so the session keyboard goes on via edit_reply_markup.
+    online_alert = online_text.replace("<b>", "").replace("</b>", "")
+    if card is not None:
+        await card.answer(online_alert)
+        try:
+            await card.edit_reply_markup(
+                reply_markup=anonymous_chat_menu_kb()
+            )
+        except Exception:
+            pass
+    else:
+        await _fallback(
+            callback, online_text, parse_mode="HTML",
             reply_markup=anonymous_chat_menu_kb(),
         )
 
@@ -254,6 +325,33 @@ async def cb_open_anon_conversation(
 # ──────────────────────────────────────────────────
 # 4. Message Router (Hybrid Engine)
 # ──────────────────────────────────────────────────
+
+async def _rate_gate(message: Message, user_id: int) -> bool:
+    """Anti-flood gate for an inbox message. ``True`` = may proceed.
+
+    A refused send is ONLY ever a rate limit now: the per-message coin/token cost
+    is gone, so there is no second refusal reason left to explain to the user.
+
+    A plain helper, NOT a handler: it is awaited from inside
+    :func:`anon_message_router`, which owns the ``@router.message`` decorator.
+    The decorator once slid onto this function during a refactor, which made
+    aiogram run only the gate — the relay handler was never registered, and
+    every message in an anonymous session vanished after the rate check.
+    """
+    auth = await authorize_chat_message(user_id)
+    if auth.allowed:
+        return True
+    if should_warn(user_id):
+        try:
+            policy = await get_policy()
+            await message.answer(
+                rate_limit_text(auth.wait, policy.messages_per_minute)
+            )
+        except Exception as exc:  # noqa: BLE001 — a warning must not crash
+            logger.info("Could not render the rate-limit warning: %s", exc)
+            await message.answer(rate_limit_text(auth.wait))
+    return False
+
 
 @router.message(AnonChatStates.in_session, F.text)
 async def anon_message_router(
@@ -297,9 +395,14 @@ async def anon_message_router(
     )
 
     if is_partner_online:
+        # Anti-flood gate (chatting inside a connection is free of charge)
+        if not await _rate_gate(message, user_id):
+            return
         # Real-time routing: send directly
         try:
-            await message.bot.send_message(partner_id, f"💬 {content}")
+            await message.bot.send_message(
+                partner_id, f"💬 {escape(content)}"
+            )
             # Save as read since delivered instantly
             async with async_session_factory() as session:
                 msg = AnonymousMessage(
@@ -319,15 +422,18 @@ async def anon_message_router(
             )
             await state.clear()
     else:
-        # Offline: check unread count limit
+        # Offline: enforce the unanswered-message cap before storing
         unread_count = await _get_unread_count(user_id, partner_id)
 
         if unread_count >= MAX_UNREAD_MESSAGES:
             await message.answer(
-                "⚠️ شما ۱۰ پیام بی‌پاسخ ارسال کرده‌اید.\n"
+                "شما ۱۰ پیام بی‌پاسخ ارسال کرده‌اید.\n"
                 "لطفاً منتظر پاسخ بمانید.",
                 reply_markup=anonymous_chat_menu_kb(),
             )
+            return
+
+        if not await _rate_gate(message, user_id):
             return
 
         # Save to DB
@@ -389,7 +495,7 @@ async def _exit_anon_session(
             try:
                 await message.bot.send_message(
                     partner_id,
-                    "🔴 <b>مخاطب شما چت را ترک کرد.</b>",
+                    "🚫 <b>مخاطب شما چت را ترک کرد.</b>",
                     parse_mode="HTML",
                     reply_markup=main_menu_kb(),
                 )
@@ -425,44 +531,62 @@ async def cb_inbox_open(callback: CallbackQuery) -> None:
     sender_groups = await _get_sender_groups(user_id)
 
     if not sender_groups:
-        try:
-            await callback.message.edit_text("📭 صندوق شما خالی است.")
-        except Exception:
-            pass
-        await callback.message.answer(
-            "منوی اصلی:",
-            reply_markup=main_menu_kb(),
-        )
+        card = _card(callback)
+        if card is not None:
+            try:
+                await card.edit_text(
+                    "📭 صندوق شما خالی است.", reply_markup=main_menu_kb()
+                )
+            except Exception:
+                try:
+                    await card.edit_reply_markup(reply_markup=main_menu_kb())
+                except Exception:
+                    pass
+            await card.answer("منوی اصلی:")
+        else:
+            await _fallback(callback, "منوی اصلی:", reply_markup=main_menu_kb())
         return
 
     total_count = sum(len(msgs) for msgs in sender_groups.values())
     guest_count = len(sender_groups)
+    header = (
+        f"📬 <b>{total_count} پیام ناشناس خوانده‌نشده از {guest_count} نفر:</b>\n\n"
+        "روی یک کاربر کلیک کنید تا پیام‌هایش را ببینید:"
+    )
+    kb = unread_inbox_kb(sender_groups)
+    card = _card(callback)
+    if card is None:
+        await _fallback(callback, header, parse_mode="HTML", reply_markup=kb)
+        return
     try:
-        await callback.message.edit_text(
-            f"📬 <b>{total_count} پیام ناشناس خوانده‌نشده از {guest_count} نفر:</b>\n\n"
-            "روی یک کاربر کلیک کنید تا پیام‌هایش را ببینید:",
-            parse_mode="HTML",
-            reply_markup=unread_inbox_kb(sender_groups),
-        )
+        await card.edit_text(header, parse_mode="HTML", reply_markup=kb)
     except Exception:
-        await callback.message.answer(
-            f"📬 <b>{total_count} پیام ناشناس خوانده‌نشده:</b>",
-            parse_mode="HTML",
-            reply_markup=unread_inbox_kb(sender_groups),
-        )
+        # edit_text failed (likely «message is not modified») — the list may be
+        # unchanged while the buttons are stale, so refresh just the keyboard.
+        try:
+            await card.edit_reply_markup(reply_markup=kb)
+        except Exception:
+            pass
+        await card.answer(header, parse_mode="HTML")
 
 
 @router.callback_query(F.data == "inbox:back")
 async def cb_inbox_back(callback: CallbackQuery) -> None:
     """Return to main menu from inbox."""
-    try:
-        await callback.message.edit_text("✅ بازگشت به منوی اصلی.")
-    except Exception:
-        pass
-    await callback.message.answer(
-        "منوی اصلی:",
-        reply_markup=main_menu_kb(),
-    )
+    card = _card(callback)
+    if card is not None:
+        try:
+            await card.edit_text(
+                "✅ بازگشت به منوی اصلی.", reply_markup=main_menu_kb()
+            )
+        except Exception:
+            try:
+                await card.edit_reply_markup(reply_markup=main_menu_kb())
+            except Exception:
+                pass
+        await card.answer("منوی اصلی:")
+    else:
+        await _fallback(callback, "منوی اصلی:", reply_markup=main_menu_kb())
 
 
 # ──────────────────────────────────────────────────
@@ -472,8 +596,6 @@ async def cb_inbox_back(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("anon_block:"))
 async def cb_anon_block(callback: CallbackQuery) -> None:
     """Block the anonymous message sender."""
-    from database import BlockList
-
     parts = callback.data.split(":")
     if len(parts) != 3:
         await callback.answer("⚠️ خطا در پردازش.", show_alert=True)
@@ -488,35 +610,43 @@ async def cb_anon_block(callback: CallbackQuery) -> None:
 
     user_id = callback.from_user.id
 
+    # All DB work finishes before the first await that touches Telegram: the
+    # session must not sit open across a network call (it pins one of the five
+    # pooled connections for as long as the API takes to answer).
+    refusal: str | None = None
     async with async_session_factory() as session:
         result = await session.execute(
             select(AnonymousMessage).where(AnonymousMessage.id == msg_id)
         )
         msg = result.scalar_one_or_none()
         if msg is None or msg.receiver_id != user_id:
-            await callback.answer("⚠️ پیام یافت نشد.", show_alert=True)
-            return
-
-        existing = await session.execute(
-            select(BlockList).where(
-                (BlockList.blocker_id == user_id)
-                & (BlockList.blocked_id == sender_id)
+            refusal = "⚠️ پیام یافت نشد."
+        else:
+            existing = await session.execute(
+                select(BlockList).where(
+                    (BlockList.blocker_id == user_id)
+                    & (BlockList.blocked_id == sender_id)
+                )
             )
-        )
-        if existing.scalar_one_or_none() is not None:
-            await callback.answer("ℹ️ این کاربر قبلاً مسدود شده است.", show_alert=True)
-            return
+            if existing.scalar_one_or_none() is not None:
+                refusal = "ℹ️ این کاربر قبلاً مسدود شده است."
+            else:
+                session.add(BlockList(blocker_id=user_id, blocked_id=sender_id))
+                await session.commit()
 
-        session.add(BlockList(blocker_id=user_id, blocked_id=sender_id))
-        await session.commit()
+    if refusal is not None:
+        await callback.answer(refusal, show_alert=True)
+        return
 
-    try:
-        await callback.message.edit_text(
-            "🚫 <b>کاربر مسدود شد.</b>\n\n"
-            "این کاربر دیگر نمی‌تواند به شما پیام بدهد.",
-            parse_mode="HTML",
-        )
-    except Exception:
-        pass
+    card = _card(callback)
+    if card is not None:
+        try:
+            await card.edit_text(
+                "🚫 <b>کاربر مسدود شد.</b>\n\n"
+                "این کاربر دیگر نمی‌تواند به شما پیام بدهد.",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
 
     await callback.answer("🚫 کاربر مسدود شد.", show_alert=True)

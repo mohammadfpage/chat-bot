@@ -1,11 +1,37 @@
-from database.models import User, BlockList, AnonymousContact, AnonymousMessage, Base
+from database.models import (
+    User,
+    BlockList,
+    UserReport,
+    CoinTransaction,
+    AnonymousContact,
+    AnonymousMessage,
+    AnonChatSession,
+    Whisper,
+    InlineWhisper,
+    WhisperConfig,
+    RequiredChannel,
+    BotPolicy,
+    GroupChat,
+    GroupRoster,
+    Base,
+)
 from database.engine import engine, async_session_factory, init_db
 
 __all__ = [
     "User",
     "BlockList",
+    "UserReport",
+    "CoinTransaction",
     "AnonymousContact",
     "AnonymousMessage",
+    "AnonChatSession",
+    "Whisper",
+    "InlineWhisper",
+    "WhisperConfig",
+    "RequiredChannel",
+    "BotPolicy",
+    "GroupChat",
+    "GroupRoster",
     "Base",
     "engine",
     "async_session_factory",

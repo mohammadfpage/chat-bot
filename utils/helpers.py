@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import time
 from functools import wraps
+from html import escape
 from typing import Callable, Awaitable, Any
 
 from aiogram.types import Message
@@ -24,15 +25,20 @@ def format_user_profile(
     city: str | None,
     height: str | None,
 ) -> str:
-    """Return an HTML-formatted user profile string."""
+    """Return an HTML-formatted user profile string.
+
+    Every free-text field is escaped: a name or city typed as ``<b>x`` is the
+    user's own text, not markup, and unescaped it either breaks the card for
+    them or lets a profile carry markup the bot did not write.
+    """
     return (
         f"👤 <b>پروفایل کاربر</b>\n\n"
         f"🆔 آیدی: <code>{telegram_id}</code>\n"
-        f"📛 نام: {first_name or 'نامشخص'}\n"
-        f"📛 یوزرنیم: @{username or 'ندارد'}\n"
+        f"📛 نام: {escape(first_name) if first_name else 'نامشخص'}\n"
+        f"📛 یوزرنیم: @{escape(username) if username else 'ندارد'}\n"
         f"🎂 سن: {age or '—'}\n"
-        f"🏙 شهر: {city or '—'}\n"
-        f"📏 قد: {height or '—'}"
+        f"🏙 شهر: {escape(city) if city else '—'}\n"
+        f"📏 قد: {escape(height) if height else '—'}"
     )
 
 
