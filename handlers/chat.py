@@ -3,7 +3,11 @@ Core chat logic — 1-on-1 matching and real-time message relay.
 
 Design notes:
   * A user can chat with ONE partner at a time.
-  * pair_map / search_queue are kept in-memory (fast, no DB writes).
+  * pair_map / search_queue are kept in-memory (fast, no DB writes on the
+    hot path) BUT mirrored into the ``chat_pairs`` table on every change —
+    on Cloudflare the process is stopped and restarted by the platform, and
+    a pair that only exists in RAM would silently dissolve. The startup hook
+    :func:`rebuild_chat_state` reads the mirror back on wake.
   * Messages are ONLY relayed live — nothing is persisted to the database.
   * Videos / video notes / animations are strictly blocked.
   * Blocking is peer-to-peer (BlockList table), NOT global (User.is_banned).
@@ -44,10 +48,16 @@ from aiogram.enums import ChatType
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import BaseStorage, StorageKey
 from aiogram.types import CallbackQuery, Message
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from config import settings
-from database import async_session_factory, User, BlockList, UserReport
+from database import (
+    async_session_factory,
+    ChatPair,
+    User,
+    BlockList,
+    UserReport,
+)
 from keyboards import (
     NEXT_CHAT_LABEL,
     REMATCH_LABEL,
@@ -89,6 +99,11 @@ router.message.filter(F.chat.type == ChatType.PRIVATE)
 #   pair_map:      telegram_id -> partner_telegram_id
 #   search_queue:  {user_id: (mode, gender)} waiting for a partner
 #   chat_opened_at: telegram_id -> monotonic clock when this chat started
+#
+# The maps above are the live truth (matching never touches the database in
+# the hot path), but every mutation is ALSO written through to the
+# ``chat_pairs`` table — see the "durable mirror" section below and
+# :func:`rebuild_chat_state`.
 # ──────────────────────────────────────────────────
 #:
 #: The queue stores the waiter's GENDER as well as their mode. It has to: a
@@ -145,6 +160,159 @@ def _forget_pair_end(user_id: int) -> None:
     pid = last_partner.pop(user_id, None)
     if pid is not None and last_partner.get(pid) == user_id:
         last_partner.pop(pid, None)
+
+
+# ──────────────────────────────────────────────────
+# Durable mirror (``chat_pairs``) — write-through, never in the hot path
+# ──────────────────────────────────────────────────
+#
+# Every mutation of pair_map/search_queue above is reflected here, so a
+# container that is stopped mid-conversation (idle sleep, deploy, crash)
+# can put the world back on the next start. Three rules make this safe:
+#
+#   1. Writes are best-effort: a failed mirror write logs a warning and
+#      returns — it must NEVER break the user-visible flow it accompanies.
+#      The failure mode of an unwritten pair is "rebuild re-queues a user
+#      who walked away", which the user can cancel; a raised exception here
+#      would be "the match button crashes".
+#   2. "Ended" is a *conditional* UPDATE, never an upsert: it cannot create
+#      rows, so hot paths that merely clean up (/start, «منوی اصلی») leave
+#      no trace, and re-ending an already-ended row is a no-op.
+#   3. Rebuilding is done by :func:`rebuild_chat_state` — one read, under
+#      :data:`chat_lock`, before any other startup hook may look at the maps.
+
+#: Sentinel for "leave this column alone" in :func:`_write_chat_row`. A
+#: ``None`` cannot be it: ``None`` is a real value (random mode, no gender).
+_KEEP: object = object()
+
+
+async def _write_chat_row(
+    session,
+    user_id: int,
+    *,
+    status: str,
+    partner_id: int | None = None,
+    mode=_KEEP,
+    gender=_KEEP,
+) -> None:
+    """Upsert the single ``chat_pairs`` row of ``user_id`` (no commit).
+
+    ``mode``/``gender`` default to :data:`_KEEP` because the two directions of
+    a pairing carry different values and an "ended" write must not touch the
+    mode history «🔍 چت بعدی» depends on. ``opened_at`` is refreshed only
+    when a pairing is (re)made — the expiry clock belongs to the conversation,
+    not to the user.
+    """
+    row = await session.get(ChatPair, user_id)
+    if row is None:
+        row = ChatPair(user_id=user_id)
+        session.add(row)
+    row.status = status
+    row.partner_id = partner_id
+    if mode is not _KEEP:
+        row.mode = mode  # type: ignore[assignment]
+    if gender is not _KEEP:
+        row.gender = gender  # type: ignore[assignment]
+    if status == "paired":
+        row.opened_at = time.time()
+
+
+async def _persist_queue(user_id: int, mode, gender: str | None) -> None:
+    """Record that ``user_id`` is waiting for a partner."""
+    try:
+        async with async_session_factory() as session:
+            await _write_chat_row(
+                session,
+                user_id,
+                status="queued",
+                partner_id=None,
+                mode=mode,
+                gender=gender,
+            )
+            await session.commit()
+    except Exception as exc:  # noqa: BLE001 — the queue itself lives in RAM
+        logger.warning("chat_pairs: could not persist queue for %s: %s", user_id, exc)
+
+
+async def _persist_pair(
+    user_id: int,
+    partner_id: int,
+    *,
+    user_mode=_KEEP,
+    user_gender=_KEEP,
+    partner_mode=_KEEP,
+    partner_gender=_KEEP,
+) -> None:
+    """Write BOTH directions of a fresh pairing in one transaction.
+
+    One transaction on purpose: half a pair (A→paired, B→queued) would make
+    the rebuild queue B while A believes they are chatting — the exact
+    split-brain this table exists to prevent.
+    """
+    try:
+        async with async_session_factory() as session:
+            await _write_chat_row(
+                session,
+                user_id,
+                status="paired",
+                partner_id=partner_id,
+                mode=user_mode,
+                gender=user_gender,
+            )
+            await _write_chat_row(
+                session,
+                partner_id,
+                status="paired",
+                partner_id=user_id,
+                mode=partner_mode,
+                gender=partner_gender,
+            )
+            await session.commit()
+    except Exception as exc:  # noqa: BLE001 — pairing itself is in memory
+        logger.warning(
+            "chat_pairs: could not persist pair %s/%s: %s", user_id, partner_id, exc
+        )
+
+
+async def _persist_ended(*user_ids: int) -> None:
+    """Mark every given user as neither queued nor paired.
+
+    Conditional on ``status IN ('queued','paired')`` so it never inserts a row
+    for a user who has no mirror entry (the common case for cleanup paths)
+    and never rewrites a row that is already ``ended``.
+    """
+    ids = [uid for uid in user_ids if uid]
+    if not ids:
+        return
+    try:
+        async with async_session_factory() as session:
+            await session.execute(
+                update(ChatPair)
+                .where(
+                    ChatPair.user_id.in_(ids),
+                    ChatPair.status.in_(("queued", "paired")),
+                )
+                .values(status="ended", partner_id=None)
+            )
+            await session.commit()
+    except Exception as exc:  # noqa: BLE001 — teardown must not stop mid-way
+        logger.warning("chat_pairs: could not persist end of %s: %s", ids, exc)
+
+
+async def leave_search_queue(user_id: int) -> None:
+    """Drop ``user_id`` from the queue — in memory AND in the mirror.
+
+    Shared by «لغو جستجو», ``/start`` and «منوی اصلی», the three ways a
+    waiter walks away. The unconditional mirror write (one indexed UPDATE,
+    cheaper than the SELECT ``/start`` already does) also covers the row
+    that only exists on disk: if a previous ``_persist_ended`` failed, or a
+    rebuild could not run, the stale ``queued`` row would otherwise be
+    resurrected on the next wake and the user would be matched while away.
+    """
+    async with chat_lock:
+        search_queue.pop(user_id, None)
+    await _persist_ended(user_id)
+
 
 #: How often the background sweep closes chats that have outlived their lifetime.
 #: The per-message check in :func:`_relay_allowed` is the real guarantee; this
@@ -361,6 +529,7 @@ async def _sweep_expired(bot: Bot, fsm_storage: BaseStorage) -> int:
         chat_opened_at.pop(first, None)
         chat_opened_at.pop(partner, None)
         _remember_pair_end(first, partner)
+        await _persist_ended(first, partner)
         for uid in (first, partner):
             reset_rate_limits(uid)
             try:
@@ -427,6 +596,174 @@ async def stop_chat_expiry() -> None:
         await task
 
 
+# ──────────────────────────────────────────────────
+# Rebuild the in-memory state from the durable mirror (startup)
+# ──────────────────────────────────────────────────
+
+async def _free_stale_chat_state(
+    storage: BaseStorage, bot_id: int, user_id: int
+) -> None:
+    """Take a user the rebuild REJECTED out of the chat FSM states, if set.
+
+    Deliberately conditional: a rejected user may legitimately sit in some
+    other flow (profile setup, a parked whisper) that a restart does not
+    invalidate, and stomping that state to ``idle`` would strand them in a
+    wizard whose steps they have already passed.
+    """
+    key = StorageKey(bot_id=bot_id, chat_id=user_id, user_id=user_id)
+    try:
+        current = await storage.get_state(key)
+        if current in (ChatState.in_chat.state, ChatState.in_queue.state):
+            await storage.set_state(key, state=ChatState.idle)
+    except Exception as exc:  # noqa: BLE001 — one bad storage read ≠ failed boot
+        logger.warning("chat_pairs: could not free FSM state of %s: %s", user_id, exc)
+
+
+async def rebuild_chat_state(bot: Bot, storage: BaseStorage) -> None:
+    """Startup hook (registered FIRST): restore queue, pairs and last mode.
+
+    Why it exists
+    -------------
+    ``pair_map``/``search_queue``/``chat_opened_at``/``last_mode`` live in RAM.
+    On a laptop that is fine. On Cloudflare Containers the platform stops the
+    process whenever it idles and starts a fresh one on the next webhook hit —
+    without this hook every wake would silently unpair everybody mid-sentence,
+    put searchers back in an idle state their keyboard does not match, and
+    reset «🔍 چت بعدی» to random mode.
+
+    What is restored, and what is deliberately not:
+
+    ================  =======================================================
+    ``search_queue``  every ``queued`` row → back into the queue, FSM
+                      ``in_queue``
+    ``pair_map``      BOTH rows of a pair must point at each other; a
+                      one-sided or banned pair is demoted instead of
+                      resurrected. FSM ``in_chat`` for both sides.
+    ``chat_opened_at`` from ``opened_at``, so a 23-hour-old conversation
+                      still ends 1 hour after the wake, and
+                      :func:`_sweep_expired` closes it immediately if the
+                      gap ate the whole lifetime.
+    ``last_mode``     from the ``mode`` column of any row — this is why an
+                      ``ended`` row keeps its mode instead of being erased.
+    ================  =======================================================
+
+    NOT restored, each on purpose: ``last_partner`` (a blocked or vanished
+    partner would resurrect a «اتصال مجدد» button that can only answer "no"),
+    ``rematch_offers`` (an invitation is meaningless minutes later) and
+    ``_rematch_declined`` (a grudge nobody should carry across a restart).
+
+    Registered before every other ``dp.startup`` hook because they all assume
+    the maps are real: the expiry sweep would find nothing to close, and the
+    admin panel's «چت‌های فعال» count would read zero.
+    """
+    try:
+        async with async_session_factory() as session:
+            rows = list((await session.execute(select(ChatPair))).scalars().all())
+            banned = set(
+                (
+                    await session.execute(
+                        select(User.telegram_id).where(User.is_banned.is_(True))
+                    )
+                ).scalars()
+            )
+    except Exception as exc:  # noqa: BLE001 — a broken mirror must not stop boot
+        logger.error("chat_pairs: rebuild could not read the mirror: %s", exc)
+        return
+
+    if not rows:
+        logger.info("chat_pairs: mirror is empty — starting from scratch.")
+        return
+
+    now_epoch = time.time()
+    now_mono = time.monotonic()
+    demote: list[int] = []
+    queued_rows: list[ChatPair] = []
+    paired_rows: dict[int, ChatPair] = {}
+
+    async with chat_lock:
+        for row in rows:
+            uid = row.user_id
+            if row.mode is not None:
+                # ``None`` (random) is also what a MISSING entry resolves to
+                # in ``last_mode.get(uid)``, so only distinct modes are worth
+                # the memory — the mirror holds one row per user forever.
+                last_mode[uid] = row.mode
+            if uid in banned:
+                if row.status != "ended":
+                    demote.append(uid)
+                continue
+            if row.status == "paired" and row.partner_id:
+                paired_rows[uid] = row
+            elif row.status == "queued" and not row.partner_id:
+                queued_rows.append(row)
+
+        restored_pairs = 0
+        for uid, row in paired_rows.items():
+            pid = row.partner_id
+            other = paired_rows.get(pid)
+            if other is None or other.partner_id != uid:
+                # Half a pair: the partner's row is gone, ended, or points
+                # somewhere else. Only a MUTUAL pair comes back — one-sided
+                # resurrection is exactly the split-brain this table prevents.
+                demote.append(uid)
+                continue
+            if uid > pid:
+                continue  # unordered pair — handled once, by the smaller id
+
+            pair_map[uid] = pid
+            pair_map[pid] = uid
+            # opened_at is a wall-clock epoch; translate it back into the
+            # monotonic domain _expired() compares against. Negative skew
+            # (clock jumped backwards) clamps to "just opened".
+            age = max(0.0, now_epoch - row.opened_at) if row.opened_at else 0.0
+            chat_opened_at[uid] = now_mono - age
+            chat_opened_at[pid] = now_mono - age
+            restored_pairs += 1
+
+        queued_users: list[int] = []
+        for row in queued_rows:
+            if row.user_id in pair_map:
+                continue  # split-brain guard: a live pair outranks a queue row
+            search_queue[row.user_id] = (row.mode, row.gender)
+            queued_users.append(row.user_id)
+
+    # ── FSM restore, outside the lock: the storage may be Redis on a network ──
+    restored_users = [
+        uid for uid, row in paired_rows.items() if uid in pair_map
+    ] + queued_users
+    for uid in restored_users:
+        wanted = (
+            ChatState.in_chat if uid in pair_map else ChatState.in_queue
+        )
+        try:
+            await force_set_state(storage, bot.id, uid, wanted)
+        except Exception as exc:  # noqa: BLE001 — one user ≠ failed rebuild
+            logger.warning("chat_pairs: could not restore state of %s: %s", uid, exc)
+
+    for uid in demote:
+        await _free_stale_chat_state(storage, bot.id, uid)
+    if demote:
+        await _persist_ended(*demote)
+
+    logger.info(
+        "chat_pairs: restored %d chat(s), %d queued user(s); "
+        "demoted %d broken/banned entr(ies); %d row(s) read.",
+        restored_pairs,
+        len(queued_users),
+        len(demote),
+        len(rows),
+    )
+
+    # Anything already past its lifetime (the wake itself may have taken the
+    # whole 24 hours) is closed right now, with the same cards a live sweep
+    # would have sent — the users find out on the first message otherwise.
+    if restored_pairs:
+        try:
+            await _sweep_expired(bot, storage)
+        except Exception as exc:  # noqa: BLE001 — post-restore cleanup only
+            logger.warning("chat_pairs: post-rebuild sweep failed: %s", exc)
+
+
 async def _force_end(
     message: Message,
     state: FSMContext,
@@ -450,6 +787,9 @@ async def _force_end(
     partner_id = pair_map.pop(user_id, None)
     chat_opened_at.pop(user_id, None)
     reset_rate_limits(user_id)
+    # Unconditional (conditional UPDATE): even a pair the memory had already
+    # lost must not leave a ``paired`` row behind to be rebuilt later.
+    await _persist_ended(user_id, partner_id)
 
     if partner_id:
         pair_map.pop(partner_id, None)
@@ -549,9 +889,12 @@ async def _begin_search(
     last_mode[user_id] = mode
     partner_id: Optional[int] = None
     partner_mode: Optional[MatchMode] = None
+    partner_gender: str | None = None
     async with chat_lock:
         # Drop entries that can no longer be paired: already chatting, or the
-        # same user pressing a second button while queued.
+        # same user pressing a second button while queued. Deliberately NOT
+        # mirrored: the pair_map half is already written as "paired", and the
+        # user_id half is overwritten by the queue/pair write right below.
         stale = {
             uid
             for uid in search_queue
@@ -568,6 +911,7 @@ async def _begin_search(
             if not await are_blocked(user_id, candidate):
                 partner_id = candidate
                 partner_mode = their_mode
+                partner_gender = their_gender
                 search_queue.pop(candidate, None)
                 break
 
@@ -581,6 +925,19 @@ async def _begin_search(
             search_queue[user_id] = (mode, me.gender)
 
     if partner_id is not None:
+        # Mirror BOTH sides BEFORE announcing: _announce_match charges, and a
+        # charge failure tears the pair down again (_abort_pair writes "ended"
+        # over this). A container stopped in between must wake to the state
+        # the users were actually shown — paired if the cards went out, ended
+        # if the abort already happened.
+        await _persist_pair(
+            user_id,
+            partner_id,
+            user_mode=mode,
+            user_gender=me.gender,
+            partner_mode=partner_mode,
+            partner_gender=partner_gender,
+        )
         await state.set_state(ChatState.in_chat)
         await force_set_state(
             fsm_storage, message.bot.id, partner_id, ChatState.in_chat
@@ -596,6 +953,7 @@ async def _begin_search(
         return
 
     # ── Queued: say what this will cost, so the fee is never a surprise ──
+    await _persist_queue(user_id, mode, me.gender)
     await state.set_state(ChatState.in_queue)
     cost = await match_cost(mode)
     price = (
@@ -763,6 +1121,7 @@ async def _abort_pair(
         pair_map.pop(uid, None)
         chat_opened_at.pop(uid, None)
         reset_rate_limits(uid)
+    await _persist_ended(user_id, partner_id)
     try:
         await force_set_state(fsm_storage, bot.id, user_id, ChatState.idle)
         await force_set_state(fsm_storage, bot.id, partner_id, ChatState.idle)
@@ -892,8 +1251,7 @@ async def _announce_match(
 @router.message(F.text == "❌ لغو جستجو", ChatState.in_queue)
 async def cancel_search(message: Message, state: FSMContext) -> None:
     """Leave the search queue. Nothing was charged, so nothing is refunded."""
-    async with chat_lock:
-        search_queue.pop(message.from_user.id, None)
+    await leave_search_queue(message.from_user.id)
     await state.set_state(ChatState.idle)
     await message.answer("جستجو لغو شد.", reply_markup=main_menu_kb())
 
@@ -935,6 +1293,7 @@ async def report_user(message: Message, state: FSMContext, fsm_storage: BaseStor
     """
     user_id = message.from_user.id
     partner_id = pair_map.pop(user_id, None)
+    await _persist_ended(user_id, partner_id)
 
     if partner_id:
         pair_map.pop(partner_id, None)
@@ -1175,6 +1534,9 @@ async def cb_rematch_accept(
     chat_opened_at[accepter] = now
     chat_opened_at[requester] = now
     _remember_pair_end(accepter, requester)
+    # Modes kept (_KEEP): a rematch does not change what either side last
+    # SEARCHED for, and «چت بعدی» must keep repeating that choice.
+    await _persist_pair(accepter, requester)
 
     await state.set_state(ChatState.in_chat)
     await force_set_state(fsm_storage, callback.bot.id, requester, ChatState.in_chat)

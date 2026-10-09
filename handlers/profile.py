@@ -203,6 +203,12 @@ async def process_city(message: Message, state: FSMContext) -> None:
     if not city or len(city) < 2:
         await message.answer("⚠️ لطفاً نام شهر معتبر وارد کنید.")
         return
+    # Column is String(128): past that, SQLite would happily store it and
+    # PostgreSQL would reject the row with a DataError at commit time — the
+    # user would see a profile that never saves for no visible reason.
+    if len(city) > 128:
+        await message.answer("⚠️ نام شهر خیلی بلند است؛ حداکثر ۱۲۸ کاراکتر.")
+        return
 
     await state.update_data(city=city)
     await state.set_state(ProfileSetup.waiting_for_gender)
@@ -245,6 +251,11 @@ async def process_height(message: Message, state: FSMContext) -> None:
     if not message.text:
         await message.answer("⚠️ لطفاً قد خود را وارد کنید.")
         return
+    # Column is String(32) — see the note in process_city; same DataError
+    # story on PostgreSQL if a pasted paragraph gets in.
+    if len(message.text) > 32:
+        await message.answer("⚠️ قد خیلی بلند است؛ حداکثر ۳۲ کاراکتر وارد کنید.")
+        return
 
     # Store the height as-is (e.g. "180 سانتی‌متر" or just "180")
     await state.update_data(height=message.text)
@@ -254,12 +265,15 @@ async def process_height(message: Message, state: FSMContext) -> None:
 
     data = await state.get_data()
     gender_text = "زن" if data.get("gender") == "female" else "مرد"
+    # City/height are free text the user typed and this card is sent with the
+    # bot's HTML default — an unescaped "<" in a city name makes Telegram
+    # reject the whole message (hard rule: escape every user string).
     await message.answer(
         "<b>خلاصه پروفایل</b>\n\n"
         f"سن: {data['age']}\n"
-        f"شهر: {data['city']}\n"
+        f"شهر: {escape(str(data['city']))}\n"
         f"جنسیت: {gender_text}\n"
-        f"قد: {data['height']}\n\n"
+        f"قد: {escape(str(data['height']))}\n\n"
         "تایید می‌کنید؟",
         parse_mode="HTML",
         reply_markup=confirm_profile_kb(),

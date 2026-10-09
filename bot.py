@@ -1,8 +1,16 @@
 """
-Anonymous Chat Bot – Main Entry Point (Long Polling)
-=====================================================
+Anonymous Chat Bot – Main Entry Point (polling or webhook)
+==========================================================
 Initializes the Bot and Dispatcher, applies middleware, registers routers,
-clears any stale webhook, and runs long polling for simple local execution.
+then serves updates in whichever mode ``RUN_MODE`` selects:
+
+* ``RUN_MODE=polling`` (default) — long polling, zero network setup, the
+  right choice on a laptop and behind a VPN.
+* ``RUN_MODE=webhook`` — starts a local aiohttp server and registers it
+  with Telegram via ``setWebhook``. The server speaks plain HTTP; the
+  public https:// hop (cloudflared tunnel locally, a domain + TLS or a
+  tunnel in production) is provided by whatever sits in front of it, so no
+  certificate ever has to be generated for a test run. See ``WEBHOOK.md``.
 
 Two pieces of the reply-keyboard policy live here:
 
@@ -24,14 +32,19 @@ import asyncio
 import inspect
 import logging
 import re
+import secrets
+import signal
+from contextlib import suppress
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from aiohttp import web
 from aiogram.client.default import DefaultBotProperties
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramNetworkError
+from aiogram.fsm.storage.base import BaseStorage
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.session.base import BaseSession
@@ -42,10 +55,15 @@ from aiogram.types import (
     BotCommandScopeChat,
     BotCommandScopeDefault,
 )
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 from config import BASE_DIR, settings
 from database import engine, init_db
-from handlers.chat import start_chat_expiry, stop_chat_expiry
+from handlers.chat import (
+    rebuild_chat_state,
+    start_chat_expiry,
+    stop_chat_expiry,
+)
 from middleware import (
     AdminPanelGuardMiddleware,
     BlockBannedMiddleware,
@@ -402,13 +420,95 @@ async def _spawn_keyboard_cleanup(bot: Bot) -> None:
     )
 
 
+# ──────────────────────────────────────────────────────────────
+# FSM storage: MemoryStorage locally, Redis in the container
+# ──────────────────────────────────────────────────────────────
+
+def build_fsm_storage(redis_url: str | None = None) -> BaseStorage:
+    """Pick the aiogram FSM backend from ``REDIS_URL``.
+
+    Local/default: ``MemoryStorage`` — state dies with the process, which is
+    exactly right for a laptop that is restarted on purpose.
+
+    Container: a Redis URL keeps FSM states across the platform's stop/start
+    cycles, so a user mid-profile-setup or mid-queue does not lose their
+    place when the container sleeps. The URL is only *parsed* here (no
+    connection is opened until the first storage op), so a typo degrades to
+    MemoryStorage with a loud log instead of an import/startup crash — and
+    because the failure is logged as an error, an unreachable Redis in
+    production is visible rather than silently "working".
+
+    Passwords in the URL are masked in the log, same as ``PROXY_URL``.
+    """
+    url = (settings.redis_url if redis_url is None else redis_url or "").strip()
+    if not url:
+        return MemoryStorage()
+    try:
+        from aiogram.fsm.storage.redis import RedisStorage
+
+        storage = RedisStorage.from_url(url)
+    except Exception as exc:  # noqa: BLE001 — a bad REDIS_URL must not stop boot
+        logger.error(
+            "REDIS_URL is set but unusable (%s) — falling back to MemoryStorage. "
+            "FSM state will NOT survive a restart.", exc,
+        )
+        return MemoryStorage()
+    logger.info("FSM storage: Redis (%s)", _mask_proxy(url))
+    return storage
+
+
+# ──────────────────────────────────────────────────────────────
+# Graceful stop (SIGTERM) — container shutdown, docker stop, systemd
+# ──────────────────────────────────────────────────────────────
+
+def _install_stop_signal() -> None:
+    """Turn SIGTERM into a cancellation of the running ``main()`` task.
+
+    Cloudflare Containers (like systemd and ``docker stop``) stop a process
+    with SIGTERM and escalate to SIGKILL after a grace period. Python's
+    default SIGTERM action is immediate process death: ``finally`` blocks
+    never run, the aiohttp server is torn down mid-request, pooled DB
+    connections are left open and SQLite WAL files never checkpoint. Routing
+    SIGTERM into ``task.cancel()`` reuses the exact shutdown path Ctrl+C
+    already takes (``run_webhook``'s ``finally``, ``main()``'s ``finally``).
+
+    The handler is installed from *inside* ``main()`` so the task being
+    cancelled is the one actually running the bot. ``loop.add_signal_handler``
+    is unavailable for SIGTERM on Windows (Proactor loop) — the
+    ``signal.signal`` fallback there still works because Python runs signal
+    handlers in the main thread and merely schedules the cancellation.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+        task = asyncio.current_task()
+    except RuntimeError:
+        return  # no running loop — nothing to cancel
+    if task is None:
+        return
+
+    def _request_stop() -> None:
+        if not task.done():
+            logger.info("SIGTERM received — shutting down cleanly.")
+            task.cancel()
+
+    try:
+        loop.add_signal_handler(signal.SIGTERM, _request_stop)
+    except (NotImplementedError, RuntimeError, ValueError):
+        with suppress(ValueError):
+            # signal.signal handlers may only be set in the main thread.
+            signal.signal(
+                signal.SIGTERM,
+                lambda *_: loop.call_soon_threadsafe(_request_stop),
+            )
+
+
 async def build_bot_and_dispatcher() -> tuple[Bot, Dispatcher]:
     """Create the Bot and Dispatcher, register routers + middleware."""
     # ── FSM storage ──
-    # Production: swap MemoryStorage with RedisStorage for multi-worker support:
-    #   from aiogram.fsm.storage.redis import RedisStorage
-    #   storage = RedisStorage.from_url("redis://localhost:6379")
-    storage = MemoryStorage()
+    # MemoryStorage by default (local polling); RedisStorage when REDIS_URL
+    # is set, which is what keeps a user's place in a wizard across host
+    # restarts/sleeps (Render, Cloudflare, …). See build_fsm_storage.
+    storage = build_fsm_storage(settings.redis_url)
 
     bot = Bot(
         token=settings.bot_token,
@@ -499,6 +599,16 @@ async def build_bot_and_dispatcher() -> tuple[Bot, Dispatcher]:
     dp.include_router(chat_router)
     dp.include_router(profile_router)
     dp.include_router(start_router)
+
+    # ── Startup hook: rebuild the chat state from the durable mirror ──
+    # MUST be registered FIRST: pair_map/search_queue/chat_opened_at are
+    # written through to the chat_pairs table (handlers/chat.py), and every
+    # hook below — the expiry sweep above all — assumes those maps are
+    # already real. On a restart of any kind this is what re-pairs the
+    # conversations that were live, re-queues the searchers, and restores
+    # «چت بعدی»'s last mode. Needs both the bot (its id keys the FSM) and
+    # the storage (to force the restored users back into in_chat/in_queue).
+    dp.startup.register(_hook("rebuild_chat_state", rebuild_chat_state))
 
     # ── Startup hook: purge cached group reply keyboards ──
     # Telegram keys its reply-keyboard cache per chat and never flushes it when
@@ -601,6 +711,227 @@ async def _clear_webhook(bot: Bot, logger: logging.Logger) -> bool:
     return False
 
 
+# ──────────────────────────────────────────────────────────────
+# Webhook mode (RUN_MODE=webhook)
+# ──────────────────────────────────────────────────────────────
+
+#: ``setWebhook``'s ``secret_token`` may only contain ``A-Z a-z 0-9 _ -``,
+#: 1-256 characters — Telegram rejects anything else with a 400, which is a
+#: confusing error to hit after the server is already up.
+_WEBHOOK_SECRET_RE = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
+
+
+def build_webhook_url(base_url: str, path: str) -> str:
+    """Join ``WEBHOOK_BASE_URL`` + ``WEBHOOK_PATH`` and validate the result.
+
+    Telegram only delivers webhook updates to an **https://** origin (it
+    answers ``400 bad webhook: An HTTPS URL must be provided`` for anything
+    else), so a scheme that is not https is rejected here — at startup,
+    with a message that says what to change — rather than as a cryptic
+    Telegram error after the server is running.
+
+    The local aiohttp server deliberately stays plain HTTP: TLS is
+    terminated by the tunnel or reverse proxy in front of it (see
+    ``WEBHOOK.md``), which is what makes a local test possible without
+    generating a certificate.
+
+    Raises:
+        ValueError: base URL empty, not a URL, or not https.
+    """
+    base = (base_url or "").strip().rstrip("/")
+    if not base:
+        raise ValueError(
+            "WEBHOOK_BASE_URL is empty — webhook mode needs the public "
+            "https:// address Telegram should POST updates to. "
+            "«آدرس پایهٔ وبهوک (WEBHOOK_BASE_URL) خالی است.»"
+        )
+    try:
+        parts = urlsplit(base)
+    except ValueError as exc:
+        raise ValueError(f"WEBHOOK_BASE_URL is not a URL: {base!r} ({exc})") from exc
+    if parts.scheme != "https" or not parts.netloc:
+        raise ValueError(
+            f"WEBHOOK_BASE_URL must start with https:// (got {parts.scheme or 'no scheme'!r}): "
+            f"{base}. Telegram rejects plain http:// webhooks. "
+            "For a local test run `cloudflared tunnel --url http://HOST:PORT` "
+            "and paste the https:// address it prints — see WEBHOOK.md."
+        )
+    route = (path or "").strip() or "/telegram/webhook"
+    if not route.startswith("/"):
+        route = f"/{route}"
+    return f"{base}{route}"
+
+
+def webhook_secret_token() -> str:
+    """The ``secret_token`` to hand to Telegram *and* verify on each request.
+
+    A value configured in ``WEBHOOK_SECRET`` is used as-is (validated
+    against Telegram's charset, because an invalid one only fails later as
+    an opaque 400 from setWebhook). An empty setting generates a fresh
+    random token per boot — safe because ``set_webhook`` re-registers it on
+    every start, so the header Telegram sends always matches the value the
+    handler expects.
+
+    Raises:
+        ValueError: configured secret contains characters Telegram forbids.
+    """
+    configured = (settings.webhook_secret or "").strip()
+    if configured:
+        if not _WEBHOOK_SECRET_RE.match(configured):
+            raise ValueError(
+                "WEBHOOK_SECRET must be 1-256 characters of A-Z, a-z, 0-9, "
+                f"_ and - only (got {len(configured)} chars). "
+                "«WEBHOOK_SECRET فقط باید حروف، عدد، _ و - داشته باشد.»"
+            )
+        return configured
+    return secrets.token_urlsafe(24)
+
+
+def build_set_webhook_kwargs(dp: Dispatcher, *, url: str, secret: str) -> dict:
+    """Arguments for ``bot.set_webhook(...)`` — one place, testable offline.
+
+    * ``drop_pending_updates=False`` is a hard rule (see the polling branch
+      in ``main()``): dropping the queue would kill the only record behind
+      a live inline-whisper card.
+    * ``allowed_updates`` mirrors polling exactly — aiogram resolves the
+      update types from the handlers that are actually registered. Without
+      it Telegram falls back to its default list, which EXCLUDES
+      ``chat_member`` and would silently stop the group roster and the
+      onboarding card.
+    * ``secret_token`` becomes the ``X-Telegram-Bot-Api-Secret-Token``
+      header Telegram attaches to every delivery; the aiohttp handler
+      compares it before the dispatcher ever sees the request.
+    """
+    return {
+        "url": url,
+        "secret_token": secret,
+        "drop_pending_updates": False,
+        "allowed_updates": dp.resolve_used_update_types(),
+    }
+
+
+async def _webhook_health(request: web.Request) -> web.Response:
+    """``GET /health`` — a 200 the tunnel/proxy/scripts can probe."""
+    return web.json_response({"status": "ok"})
+
+
+def build_webhook_app(bot: Bot, dp: Dispatcher, secret_token: str) -> web.Application:
+    """Build the aiohttp application: the Telegram route + ``/health``.
+
+    Only *builds* — startup/shutdown wiring (``setup_application``) happens
+    in :func:`run_webhook`, so a smoke test can mount this app and POST at
+    it without triggering the bot's startup hooks (those would message real
+    groups and sweep the real database).
+
+    ``handle_in_background=True`` answers Telegram within milliseconds and
+    lets the handler finish in the background; Telegram only waits 60s
+    before re-delivering, and a slow reply here is otherwise indistinguishable
+    from a down server.
+    """
+    app = web.Application()
+    handler = SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+        handle_in_background=True,
+        secret_token=secret_token,
+    )
+    handler.register(app, settings.webhook_path)
+    app.router.add_get("/health", _webhook_health)
+    return app
+
+
+async def run_webhook(bot: Bot, dp: Dispatcher) -> None:
+    """Serve updates over webhook until interrupted. Never returns normally.
+
+    Order matters: the socket must be listening **before** ``set_webhook``
+    succeeds, or Telegram starts delivering into a connection that is not
+    there yet. On the way out the webhook is deliberately left registered —
+    Telegram keeps retrying delivery while the process is down, and the
+    next start (in either mode) re-asserts or clears it explicitly.
+
+    Raises SystemExit(1) on configuration or registration problems, after
+    cleaning the server up; ``main()``'s ``finally`` closes the session and
+    the database either way.
+    """
+    try:
+        url = build_webhook_url(settings.webhook_base_url, settings.webhook_path)
+        secret = webhook_secret_token()
+    except ValueError as exc:
+        logger.error("%s", exc)
+        logger.error(
+            "Webhook mode needs a public https:// URL. Quick local test "
+            "WITHOUT any SSL setup / تست لوکال بدون SSL:\n"
+            "  1) cloudflared tunnel --url http://%s:%s\n"
+            "  2) copy the https://... address it prints into "
+            "WEBHOOK_BASE_URL in .env, then restart the bot.\n"
+            "Details: WEBHOOK.md",
+            settings.webapp_host,
+            settings.webapp_port,
+        )
+        raise SystemExit(1)
+
+    app = build_webhook_app(bot, dp, secret)
+    # Wires dp.startup/dp.shutdown (keyboard sweep, roster sync, retention,
+    # chat expiry) and the handler's session close to the app lifecycle.
+    # Must be called AFTER build_bot_and_dispatcher(): workflow_data is
+    # captured by value here.
+    setup_application(app, dp, bot=bot)
+
+    runner = web.AppRunner(app, handle_signals=False)
+    await runner.setup()
+    site = web.TCPSite(runner, settings.webapp_host, settings.webapp_port)
+    await site.start()
+    logger.info(
+        "Webhook server listening on http://%s:%s%s",
+        settings.webapp_host,
+        settings.webapp_port,
+        settings.webhook_path,
+    )
+
+    try:
+        await bot.set_webhook(**build_set_webhook_kwargs(dp, url=url, secret=secret))
+    except TelegramNetworkError as exc:
+        log_connection_advice(f"set_webhook failed: {type(exc).__name__}: {exc}", bot)
+        await runner.cleanup()
+        raise SystemExit(1)
+    except Exception as exc:
+        logger.error("set_webhook rejected by Telegram: %s", exc)
+        logger.error(
+            "Common causes / علل رایج:\n"
+            "  * URL must be https:// and reachable from the internet — "
+            "Telegram refuses plain http:// (use a tunnel for local tests).\n"
+            "  * When Telegram connects DIRECTLY, only ports 443, 80, 88 and "
+            "8443 are accepted; a tunnel or reverse proxy hides any port.\n"
+            "  * WEBHOOK_SECRET characters must be A-Z a-z 0-9 _ - only.\n"
+            "Details: WEBHOOK.md"
+        )
+        await runner.cleanup()
+        raise SystemExit(1)
+
+    logger.info("Webhook registered: %s (pending updates NOT dropped).", url)
+    logger.info(
+        "Health check: http://%s:%s/health",
+        settings.webapp_host,
+        settings.webapp_port,
+    )
+
+    try:
+        # Run until the task is cancelled: Ctrl+C raises KeyboardInterrupt
+        # inside the event loop, asyncio.run then cancels this task, and
+        # the finally below still runs (a second cancel never arrives, so
+        # the awaits inside it complete). handle_signals=False keeps that
+        # single story on every platform — aiohttp's SIGINT handler would
+        # otherwise raise GracefulExit on POSIX and KeyboardInterrupt on
+        # Windows, i.e. two different shutdown paths to maintain.
+        await asyncio.Future()
+    finally:
+        # NOT bot.delete_webhook(): Telegram retries failed deliveries for
+        # a while, so a quick restart picks the queue back up instead of
+        # losing whatever arrived during the gap. Switching to polling
+        # clears it explicitly on the next start anyway.
+        await runner.cleanup()
+
+
 async def register_commands(bot, *, whisper_on: bool, admin_ids) -> None:
     """Publish the Telegram ``/`` menu — in private chats only.
 
@@ -657,10 +988,38 @@ async def register_commands(bot, *, whisper_on: bool, admin_ids) -> None:
 
 async def main() -> None:
     _setup_logging()
+    _install_stop_signal()
+
+    # ── Ephemeral-host safety rail ──
+    # A Cloudflare container's filesystem is ephemeral: a SQLite file written
+    # there is gone the moment the platform stops the instance, i.e. the whole
+    # user database silently resets on the first idle sleep. Refusing to start
+    # is the only honest answer — set DATABASE_URL to a managed PostgreSQL
+    # (store it as the platform's DATABASE_URL environment variable) instead.
+    if settings.in_cloudflare_container and settings.database_dialect == "sqlite":
+        logger.error(
+            "Running inside a Cloudflare container with a SQLite database: "
+            "the container filesystem is EPHEMERAL, so database.db would be "
+            "wiped on the next stop/sleep. Aborting. "
+            "Set DATABASE_URL to postgresql+asyncpg://… as a platform "
+            "environment variable."
+        )
+        raise SystemExit(1)
+
+    # A managed host assigns PORT and usually has no persistent disk either
+    # (e.g. Render's free plan). SQLite there loses every user on redeploy or
+    # restart — warn loudly, but do not abort: an operator may know what they
+    # are doing (a paid plan with a mounted disk, or a throwaway test).
+    if settings.port and settings.database_dialect == "sqlite":
+        logger.warning(
+            "PORT is set (a managed host) but DATABASE_URL is SQLite. Most "
+            "hosts wipe the filesystem between deploys/sleeps, so user data "
+            "will be lost — use managed PostgreSQL in production."
+        )
 
     # ── Database ──
     await init_db()
-    logger.info("Database initialized.")
+    logger.info("Database initialized (%s).", settings.database_dialect)
 
     if not settings.bot_token or settings.bot_token == "YOUR_BOT_TOKEN_HERE":
         logger.error("BOT_TOKEN is not set in .env. Aborting.")
@@ -676,9 +1035,10 @@ async def main() -> None:
         admin_ids=settings.admin_ids_list,
     )
 
-    # ── Drop any stale webhook, then poll for updates ──
+    # ── Drop any stale webhook, then serve updates ──
     #
-    # ``drop_pending_updates=False`` on purpose. A ``chosen_inline_result``
+    # ``drop_pending_updates=False`` on purpose (both modes). A
+    # ``chosen_inline_result``
     # that arrives while the bot is offline is the ONLY record of the row
     # behind a live inline-whisper card — Telegram posts the card the moment
     # the sender picks it, bot or no bot. Dropping pending updates (the old
@@ -694,6 +1054,8 @@ async def main() -> None:
     # retried with a backoff; if Telegram still cannot be reached the bot
     # falls back to a direct connection (when a proxy was in play), then
     # exits cleanly with a troubleshooting block instead of a stack trace.
+    # Webhook mode runs it too: clearing the old registration both probes the
+    # network and guarantees no stale URL survives a mode/config change.
     reachable = await _clear_webhook(bot, logger)
 
     if not reachable and await _fallback_to_direct(bot):
@@ -708,15 +1070,19 @@ async def main() -> None:
         await bot.session.close()
         raise SystemExit(1)
 
-    logger.info("Webhook cleared. Starting long polling...")
+    logger.info("Telegram reachable; stale webhook cleared.")
 
     try:
-        await dp.start_polling(bot)
+        if settings.webhook_mode:
+            await run_webhook(bot, dp)
+        else:
+            logger.info("Starting long polling...")
+            await dp.start_polling(bot)
     except TelegramNetworkError as exc:
         # Polling runs for days: the proxy can die mid-run (VPN dropped, the
         # proxy process was closed, the network changed). Same treatment as a
         # failed start — advice, clean shutdown, non-zero exit code.
-        log_connection_advice(f"long polling stopped: {type(exc).__name__}: {exc}", bot)
+        log_connection_advice(f"updates stopped: {type(exc).__name__}: {exc}", bot)
         raise SystemExit(1)
     finally:
         await bot.session.close()
@@ -733,9 +1099,13 @@ async def main() -> None:
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except KeyboardInterrupt:
-        # No log here: main()'s own ``finally`` already reports the stop, and
-        # a second line used to print "Bot stopped." twice on every Ctrl+C.
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        # KeyboardInterrupt: Ctrl+C — main()'s own ``finally`` already
+        # reports the stop, and a second line used to print "Bot stopped."
+        # twice on every Ctrl+C.
+        # CancelledError: the SIGTERM handler cancelled main() so the SAME
+        # finally could run (see _install_stop_signal) — a container stop
+        # must look exactly like an interrupted local run.
         # ``SystemExit`` is deliberately NOT caught: a connectivity failure
         # exits with code 1 (no traceback) so scripts can detect it.
         pass

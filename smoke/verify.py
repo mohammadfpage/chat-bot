@@ -32,6 +32,8 @@ SMOKES = [
     "smoke_gift.py",
     "smoke_force_join4.py",
     "smoke_phase6.py",
+    "smoke_webhook.py",
+    "smoke_cloudflare.py",
 ]
 
 

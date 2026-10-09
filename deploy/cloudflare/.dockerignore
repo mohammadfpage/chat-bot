@@ -1,0 +1,26 @@
+# Secrets — never inside the image; the Worker forwards env vars instead.
+.env
+.env.*
+!.env.example
+*.bak
+
+# Local state: databases, WAL siblings, backups, logs
+*.db
+*.db-wal
+*.db-shm
+backups/
+logs/
+
+# Tooling / build-context noise
+.git/
+.github/
+.opencode/
+.vscode/
+.idea/
+venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+node_modules/
+.wrangler/

@@ -21,9 +21,9 @@ Persian (Farsi) anonymous-chat bot for Telegram:
 - **پنل ادمین** — آمار، بن/آنبن، تبلیغ، مدیریت ادمین، هدیه سکه، تنظیمات سیاست (قیمت/پاداش/لیمیت).
 - **سکه (Coins)** — تنها ارز؛ شارژ، کیف پول، روزانه، زیرمجموعه‌گیری. Single currency, decimal (2 places).
 
-Stack: **aiogram 3.31 (pinned) · SQLAlchemy 2 async · aiosqlite (SQLite `database.db`) · pydantic-settings · Python 3.12 · long polling (no webhook)**.
+Stack: **aiogram 3.31 (pinned) · SQLAlchemy 2 async · aiosqlite (SQLite `database.db`) / asyncpg (PostgreSQL, production) · pydantic-settings · Python 3.12 · two run modes: long polling (default) or aiohttp webhook server (`RUN_MODE`)** — see §2b and §2c. Current deployment = **Render Python Web Service** (`render.yaml`); Cloudflare Containers is optional (`deploy/cloudflare/`).
 
-`requirements.txt`: `aiogram, sqlalchemy[asyncio], aiosqlite, asyncpg, pydantic-settings, pydantic, redis` — asyncpg/redis are *for a future PostgreSQL/Redis move*, not used now.
+`requirements.txt`: `aiogram, sqlalchemy[asyncio], aiosqlite, asyncpg, redis, pydantic-settings, pydantic` — asyncpg + redis are USED by PRODUCTION (the current Render Python web service, plus the optional Cloudflare Containers path): `DATABASE_URL=postgresql+asyncpg://…`, `REDIS_URL` for FSM; locally neither is imported at startup.
 
 ---
 
@@ -37,7 +37,7 @@ $env:PYTHONIOENCODING='utf-8'; python bot.py
 
 - Config comes from `.env` (`config.py` → `settings`). Token in `.env`; `.env.example` documents every key.
 - No linter/test framework installed (no ruff/flake8/pyflakes/pytest). Verification = compile + import + smoke scripts.
-- **One command runs everything** (compileall → `import bot` → all 7 smokes, UTF-8, non-zero exit on any failure):
+- **One command runs everything** (compileall → `import bot` → all 9 smokes, UTF-8, non-zero exit on any failure):
 
 ```powershell
 $env:PYTHONIOENCODING='utf-8'; & "D:\Project\chat bot\venv\Scripts\python.exe" "D:\Project\chat bot\smoke\verify.py"
@@ -52,6 +52,8 @@ $env:PYTHONIOENCODING='utf-8'; & "D:\Project\chat bot\venv\Scripts\python.exe" "
   - `smoke_gift.py` — gift scope/confirm/bulk + `cb_gift_confirm`-before-prefix registration order
   - `smoke_force_join4.py` (39) — membership cache, re-check fail-open, prompt dedupe ("accepting: api down" line is expected output)
   - `smoke_phase6.py` (76) — backup rotation, retention purge (5 tables incl. `user_reports`), wallet coin history, chat-ended keyboard + rematch lockout, report inbox, flags editor, whisper maxlen, privacy source scans
+  - `smoke_webhook.py` (35) — RUN_MODE normalisation, `build_webhook_url` https rules, secret charset, `build_set_webhook_kwargs` (drop_pending=False, `chat_member` in allowed_updates), aiohttp app routes + secret-token 401/200 gate (offline TestClient)
+  - `smoke_cloudflare.py` (90+) — postgres URL normalisation + `database_dialect`/`in_cloudflare_container`, `engine_options` per backend, `ChatPair` schema, **functional rebuild** (persist → wipe RAM → `rebuild_chat_state` → queue/pairs/FSM/last_mode restored, one-sided/banned demoted), `_persist_pair`/`_persist_ended`/`leave_search_queue`, `build_fsm_storage` backends, `_install_stop_signal`, startup-hook order, static checks of the optional `deploy/cloudflare/` files, the no-Wrangler root invariant, `render.yaml`, and `PORT` handling
 - Smokes must keep the whole-repo rglob filters excluding `venv`/`.opencode`/`smoke` (fixture reason-strings would false-fail).
 - PowerShell gotchas: no `rg` in this shell (use the grep tool or `Select-String`); `python -c` with quotes gets mangled → write a temp `.py` file instead; `&` chaining works, `&&` does not in PS 5.1; the console is cp1252 → set `PYTHONIOENCODING=utf-8` or reconfigure stdout; do NOT grep outputs case-insensitively for `fail`/`traceback` (phase2/force_join4 print those words on success) — rely on exit codes.
 
@@ -71,6 +73,55 @@ $env:PYTHONIOENCODING='utf-8'; & "D:\Project\chat bot\venv\Scripts\python.exe" "
 
 ---
 
+### وبهوک / Webhook — `RUN_MODE` (`bot.py` + `config.py`)
+
+Two modes selected by `RUN_MODE` in `.env` (unknown value → polling + warning): `polling` (default, unchanged) and `webhook`. Full user guide = **`WEBHOOK.md`** (local no-SSL test, server deploy, Cloudflare research).
+
+- `config.py`: `run_mode`, `webhook_base_url` (public https origin, trailing `/` stripped), `webhook_path` (leading `/` forced), `webhook_secret`, `webapp_host` (`127.0.0.1`), `webapp_port` (`8080`), `webhook_mode` property; all normalised by `_normalize_run_mode`.
+- `bot.py` webhook section: `build_webhook_url` (rejects empty/non-https base with EN/FA ValueError), `webhook_secret_token` (`WEBHOOK_SECRET` validated against `^[A-Za-z0-9_-]{1,256}$`, empty → `secrets.token_urlsafe(24)` per boot), `build_set_webhook_kwargs` (`url`, `secret_token`, **`drop_pending_updates=False`**, `allowed_updates=dp.resolve_used_update_types()` — mirrors polling; without it Telegram's default excludes `chat_member` and the roster/onboarding dies), `build_webhook_app` (POST `webhook_path` via `SimpleRequestHandler(handle_in_background=True, secret_token=…)` + `GET /health`), `run_webhook`.
+- `run_webhook` order: validate URL/secret → `build_webhook_app` → `setup_application(app, dp, bot=bot)` (**must come after `build_bot_and_dispatcher()` — workflow_data is captured by value**) → `AppRunner(handle_signals=False)` → `TCPSite.start()` → THEN `bot.set_webhook` (socket must listen first). Fails: network → `log_connection_advice`; Telegram 400 → port/https/secret hints; both → `SystemExit(1)` after `runner.cleanup()`. Runs until cancelled (`await asyncio.Future()`), **webhook is NOT deleted on shutdown** (Telegram keeps retrying; next start re-asserts or polling clears it).
+- `main()` branches after the shared `_clear_webhook` reachability probe (the probe also clears stale registration in webhook mode); `finally` closes session + disposes engine in both modes.
+- Local test without SSL: `cloudflared tunnel --url http://127.0.0.1:8080` → paste https URL into `WEBHOOK_BASE_URL`. Telegram accepts **only https://** and only ports **443/80/88/8443** when connecting directly (a tunnel hides the local port) — the local server is plain HTTP, TLS belongs to the tunnel/proxy.
+- `smoke/smoke_webhook.py` (35 checks, offline): config normalisation, URL/secret rules, setWebhook kwargs, TestClient POSTs (no secret → 401, wrong → 401, valid → 200). **It deliberately does NOT call `setup_application`** — aiohttp's `runner.setup()`/`TestServer.start_server()` fires `app.on_startup`, and the startup hooks message real groups + sweep the real DB.
+
+### استقرار — `§2c` (فعلی: Render؛ Cloudflare اختیاری)
+
+**Current deployment = an ordinary Python Web Service (Render) driven by the
+root `render.yaml`: `pip install -r requirements.txt` + `python bot.py`, webhook
+mode, binds platform `PORT` on `0.0.0.0`, `/health` health check. No Docker, no
+Wrangler, no Node. `config.port` (env `PORT`) overrides `WEBAPP_PORT` and, when
+`WEBAPP_HOST` was not set explicitly, widens the bind to `0.0.0.0`. Render Free
+sleeps after ~15 min and has no persistent disk → production MUST use managed
+PostgreSQL (`DATABASE_URL`) + Redis (`REDIS_URL`).**
+
+The old Cloudflare Containers setup is preserved **outside the repo root** under
+`deploy/cloudflare/` (so no platform auto-detects a Node/Worker project and runs
+`npx wrangler deploy`). Whole bot runs as a Docker image behind a tiny Worker
+(no VPS) if that option is restored. Build files:
+
+| File (all under `deploy/cloudflare/`) | Role |
+| --- | --- |
+| `Dockerfile` | `python:3.12-alpine`, pip install requirements, `CMD ["python","bot.py"]`, `EXPOSE 8080` (needs repo-root build context) |
+| `.dockerignore` | keeps `.env`, `venv/`, `*.db*`, `backups/`, `logs/`, `node_modules/` OUT of the image (secrets arrive as env vars) |
+| `wrangler.jsonc` | `containers[]` (`class_name: BotContainer`, `image: ./Dockerfile`, **`max_instances: 1` — pair_map is per-process, 2 instances = split worlds**), `durable_objects.bindings` `BOT_CONTAINER`, **`exports`** (`{"type":"durable-object","storage":"sqlite"}` — cannot coexist with legacy `migrations`), `vars` (RUN_MODE=webhook, WEBHOOK_PATH, WEBHOOK_BASE_URL="", WEBAPP_HOST=0.0.0.0/8080, ADMIN_IDS, CHANNEL_*, LOG_FILE="", GROUP_KEYBOARD_CLEANUP=false) |
+| `worker/index.js` | `BotContainer extends Container` (`defaultPort=8080`, `sleepAfter="10m"`, constructor copies every **string** Worker env entry → `this.envVars` = how vars + `wrangler secret put` values reach the container — platform injects only `CLOUDFLARE_*`); default export **path-gates**: only `POST env.WEBHOOK_PATH` and `GET /health` are proxied via `env.BOT_CONTAINER.getByName("bot").fetch(request)`; everything else 404s **without touching the DO** (no accidental cold-boot) |
+| `package.json` | `@cloudflare/containers ^0.3.7` (bundled by wrangler), `wrangler ^4.148.0`, `type: module`; scripts `deploy`/`dev`/`tail` |
+
+Secrets (never in git): `npx wrangler secret put` → **BOT_TOKEN, DATABASE_URL, WEBHOOK_SECRET, REDIS_URL, PROXY_URL**. Re-put + `npx wrangler deploy` to rotate (envVars are read at container start). Deploy needs **Node 20+ AND a running Docker daemon** (wrangler builds the image locally — even `--dry-run` demands the Docker CLI; `--containers-rollout=none` skips the container and only deploys the Worker). Verified offline: `npx wrangler deploy --dry-run --containers-rollout=none` bundles the Worker (54 KiB) and lists the `BOT_CONTAINER` binding + all vars + container `anon-chat-bot-botcontainer` from the Dockerfile.
+
+Design decisions (all covered by `smoke_cloudflare.py`):
+
+- **`database/models.py::ChatPair`** (`chat_pairs`, ONE row per user, PK `user_id` BigInteger `autoincrement=False`) = durable mirror of the RAM state; `status queued|paired|ended`, `mode`/`gender` kept even after `ended` («چت بعدی» repeats the mode across restarts), `opened_at` = **Python epoch float** (SQLite and PostgreSQL disagree on `now()`).
+- **`handlers/chat.py` persistence**: `_KEEP` sentinel (`_write_chat_row` — unchanged columns untouched), `_persist_queue`, `_persist_pair` (BOTH directions in ONE txn — half a pair = split-brain), `_persist_ended` (**conditional UPDATE** on `status IN ('queued','paired')` — never inserts a row for a stranger), `leave_search_queue` (RAM pop + mirror write; called from cancel_search/nav_start/_to_main_menu).
+- **`rebuild_chat_state(bot, storage)`** — startup hook registered **FIRST** (before roster/persistence/expiry/retention): restores `search_queue`, mutual-only `pair_map`, `chat_opened_at` (epoch→monotonic), `last_mode`; FSM → `in_queue`/`in_chat`; demotes one-sided/banned rows (RAM + persisted `ended`); deliberately does NOT restore `last_partner`/`rematch_offers`/`_rematch_declined`; then runs `_sweep_expired` once.
+- **`config.py`**: `redis_url`, `cloudflare_deployment_id` (platform-injected, read-only), `_normalize_database_url` (`postgres://`/`postgresql://` → `postgresql+asyncpg://`), properties `database_dialect` (`postgresql`/`sqlite`/scheme) and `in_cloudflare_container`.
+- **`database/engine.py::engine_options(url)`** (pure): sqlite → `connect_args timeout=30`; postgres → `server_settings timezone=UTC` + `pool_size 10/max_overflow 20/pool_recycle 1800`; sqlite PRAGMA hook gated on `database_dialect == "sqlite"`.
+- **`bot.py`**: `build_fsm_storage(redis_url)` (RedisStorage lazily / MemoryStorage fallback with error log; URL never printed raw), `_install_stop_signal()` (SIGTERM → `task.cancel()`, `add_signal_handler` + `signal.signal`/`call_soon_threadsafe` fallback for Windows), `main()` = stop-signal **then** `in_cloudflare_container AND database_dialect == "sqlite"` → `SystemExit(1)` guard (ephemeral disk) **before** `init_db()`.
+- Guards added for PG/any-DB: `handlers/profile.py` city ≤128 / height ≤32 (validated + escaped in confirm card), `handlers/admin.py::cb_backup` shows a Persian pg_dump hint when dialect ≠ sqlite (never sends a stale `database.db`).
+- Ops: container idles 10 min → SIGTERM (no SIGKILL); next webhook/`/health` boots fresh and rebuilds; `/health` = `{"status":"ok"}`; `max_instances` must stay 1; Workers Paid + egress. `LOG_FILE=""` (stdout only), `GROUP_KEYBOARD_CLEANUP=false` (middleware still covers first sight).
+
+---
+
 ## ۳. ساختار پوشه‌ها / Directory map
 
 ```
@@ -78,15 +129,23 @@ bot.py              entry point, wiring, register_commands, main()
 config.py           pydantic-settings Settings (all .env keys) + admin_ids parsing
 filters.py          IsAdmin / IsRootAdmin / IsProfileComplete / IsBanned
 test_connection.py  standalone reachability probe (direct / PROXY_URL / getMe)
-database/           models, engine (init_db migration), session factory
+database/           models (incl. ChatPair mirror), engine (init_db migration + engine_options), session factory
 handlers/           all aiogram routers (12 files)
 keyboards/          reply.py, inline.py, admin.py, user.py, __init__.py
 middleware/         admin_guard, force_join, keyboard_guard, group_*_watch
 states/fsm.py       all FSM StatesGroups
 utils/              economy, emoji, group_*, roster, whisper helpers
 smoke/              verify.py (one-command runner) + smoke_*.py self-checks (no Telegram needed)
-scripts/            backup_db.py (online sqlite backup + rotation)
-.env / .env.example / requirements.txt / pixel-bot.service (systemd, for a server)
+scripts/            backup_db.py (online sqlite backup + rotation; sqlite3-only — see cb_backup guard)
+render.yaml         CURRENT deployment: Render Python Web Service (pip install + python bot.py; no Docker/wrangler)
+deploy/cloudflare/  OPTIONAL Cloudflare Containers files, kept OUT of the repo root so no host auto-runs wrangler:
+  Dockerfile        (python:3.12-alpine → python bot.py, EXPOSE 8080; needs repo-root build context)
+  .dockerignore     (keeps .env / venv / *.db* / backups / node_modules out of the image)
+  wrangler.jsonc    (Worker + container config: vars, DO binding, max_instances 1)
+  worker/index.js   (path gate + env/secret forwarding to the container)
+  package.json      (@cloudflare/containers + wrangler — Node tooling)
+.env / .env.example / requirements.txt / pixel-bot.service (systemd, for a server) /
+  README.md (run + Render deploy + optional Cloudflare) / WEBHOOK.md (webhook guide + research)
 ```
 
 ### handlers/ (routers — order matters, see §4)
@@ -154,10 +213,10 @@ Plus **session-level** `install_keyboard_guard(bot)` — wraps the Bot session s
    - `inline_anon` first so state-gated catch-alls don't swallow the reply to an inline card.
    - `anon_chat` before menu routers (bare message handler with its own SkipHandler bail-out).
    - `navigation` first among *menu* routers; `keyboard_fix` above every state-gated catch-all.
-5. startup hooks: `cleanup_group_keyboards` → `start_roster_sync` → `start_persistence` → `start_chat_expiry`; matching shutdowns.
+5. startup hooks in this order: **`rebuild_chat_state` (FIRST — everything else assumes the maps are real)** → group keyboard cleanup → `start_roster_sync` → `start_persistence` → `start_chat_expiry` → `start_retention`; matching shutdowns.
 6. `dp.workflow_data["dp"]`, `["storage"]` for handlers/startup callbacks.
 
-`main()`: `logging.basicConfig` → `init_db()` → token check → build → `register_commands()` → `_clear_webhook()` (retry) → `dp.startup`/`start_polling`.
+`main()`: `_install_stop_signal()` (SIGTERM → cancel the running task) → container+SQLite guard (`in_cloudflare_container` + `database_dialect == "sqlite"` → `SystemExit(1)`) → `logging.basicConfig` → `init_db()` → token check → build → `register_commands()` → `_clear_webhook()` (retry) → `dp.startup`/`start_polling` (or `run_webhook`).
 
 `register_commands()` — **private scope only**: sets commands scoped to `AllPrivateChats` and **deletes** group/default scopes (deleting is what actually empties a scope; overwriting doesn't).
 
@@ -173,6 +232,7 @@ Plus **session-level** `install_keyboard_guard(bot)` — wraps the Bot session s
 6. **Decimal costs**: only the 4 `BotPolicy` costs are fractional (`Float` columns); rewards/limits stay integers; all money math goes through `round_coins`/`fmt_coins`/`parse_amount`. UI shows `fmt_coins` (`7.5 سکه`), never raw `str(float)`.
 7. **Never `drop_pending_updates=True`** — losing a `chosen_inline_result` leaves a dead نجوا card. Keep `False` in `delete_webhook`.
 8. **Session/DB style**: always `async with async_session_factory() as session:`; no raw SQL outside `init_db()`.
+9. **Cloudflare invariants**: `max_instances` stays **1** (RAM state is per-process); no SQLite inside the container (boot guard refuses it — ephemeral disk); secrets only via `wrangler secret put` (never `vars`, never `.env` in the image); the Worker path gate must keep waking the container ONLY for `POST WEBHOOK_PATH`/`GET /health`; `chat_pairs` writes stay on the `_persist_*`/`leave_search_queue` helpers (raw writes bypass the split-brain rules).
 
 ---
 
@@ -233,7 +293,13 @@ Plus **session-level** `install_keyboard_guard(bot)` — wraps the Bot session s
 
 20. **آیدی کانال داخل متن پرامپت عضویت اجباری** — new `utils/membership.py::join_bullet(chat)` renders each join line as `• عنوان — <a href="https://t.me/x">@x</a>` (copyable ID for users whose URL-button tap dies on a bad VPN; title alone linked when it already IS `@handle`; private invite links get a `لینک عضویت` label; derived `t.me/c/…` omitted). Used by ALL 4 prompt sites: `middleware/force_join._answer_join_prompt`, `whisper._join_prompt_text` + both single-channel `_JOIN_PROMPT.format` sites, `inline_anon.join_prompt_text` (also feeds `start._handle_inline_help`). Dedupe fires only on a leading `@` + casefold-equal username — a plain casefold eats display titles like `MyChan` (caught by `smoke_force_join4`).
 
-Git: single commit `821db80 create project` (3701 files incl. `venv/`); everything since is **staged only** — the index holds the **64 project files** (all edits staged, 0 unstaged) while `git diff --cached` counts ~3734 paths because the 3647 `venv/`+junk paths are staged as DELETIONS (`.gitignore` blocks re-adding). **The user commits, never commit yourself.** `.env`/`.env.bak`/`database.db`/`venv/`/`backups/`/`logs/` are ignored — `git status` should stay quiet.
+21. **حالت وبهوک (`RUN_MODE`)** — dual run mode: `polling` (default, untouched) / `webhook` = local aiohttp server (`SimpleRequestHandler` + `GET /health`) registered via `setWebhook`. New settings `WEBHOOK_BASE_URL/PATH/SECRET`, `WEBAPP_HOST/PORT` (`config.py:_normalize_run_mode`); `bot.py` gains `build_webhook_url` (https-only validation), `webhook_secret_token` (charset-validated or per-boot random), `build_set_webhook_kwargs` (`drop_pending_updates=False`, `allowed_updates=dp.resolve_used_update_types()` — required or `chat_member` rosters die), `build_webhook_app`, `run_webhook` (listen → set_webhook order, `AppRunner(handle_signals=False)`, webhook left registered on shutdown, network/400 failure paths EN/FA). `main()` branches after the shared `_clear_webhook` probe. Local test without any SSL via `cloudflared tunnel` (Telegram only accepts https:// + ports 443/80/88/8443). Docs: `WEBHOOK.md` incl. Cloudflare research (Workers Python = not viable for this project: no persistent disk/long-running tasks/shared memory; Containers = viable later but ephemeral disk forces a DB move; recommended = ordinary server + Cloudflare Tunnel). `.env`/`.env.example` documented; → `smoke_webhook.py` 35/35, full `verify.py` 10/10.
+
+22. **فاز ۲ — استقرار Cloudflare Containers (بدون VPS)** — the whole bot runs as a Docker image behind a path-gating Worker (see §2c for the file-by-file map). Code changes: `config.py` += `redis_url`/`cloudflare_deployment_id`/`_normalize_database_url`/`database_dialect`/`in_cloudflare_container`; `database/engine.py` += `engine_options(url)` (pure, sqlite timeout=30 vs postgres UTC+pool) and the PRAGMA hook now gated on dialect; `database/models.py` += `ChatPair` mirror (one row/user, `opened_at` Python epoch, `autoincrement=False` PK); `handlers/chat.py` += persistence section (`_KEEP`, `_write_chat_row`, `_persist_queue/_persist_pair/_persist_ended` conditional-update, `leave_search_queue`) wired into `_sweep_expired`/`_force_end`/`_abort_pair`/`report_user`/`cancel_search`/`cb_rematch_accept`/`_begin_search` + **`rebuild_chat_state`** startup hook (registered FIRST; mutual-only pairs, epoch→monotonic clock, banned/one-sided demoted+persisted, FSM restored, then `_sweep_expired`) and `_free_stale_chat_state`; `handlers/navigation.py` both `search_queue.pop` sites → `leave_search_queue`; `handlers/profile.py` city ≤128/height ≤32 guards + escaped confirm card; `handlers/admin.py::cb_backup` Persian pg-dump hint when dialect ≠ sqlite; `bot.py` += `build_fsm_storage(redis_url)` (lazy Redis / Memory fallback), `_install_stop_signal()` (SIGTERM→cancel, Windows fallback), rebuild registered first, container+sqlite boot guard; `.env.example` += `REDIS_URL`. New build files `Dockerfile`, `.dockerignore`, `wrangler.jsonc`, `worker/index.js` (string-env forwarding + path gate), `package.json`; `.gitignore` += `node_modules/`/`.wrangler/`; docs: **`README.md`** created (run + exact deploy steps: npm install → wrangler login → 5× `secret put` → deploy → set `WEBHOOK_BASE_URL` → redeploy → `curl /health`) + `WEBHOOK.md` option-2 updated to «انجام شد». → `smoke_cloudflare.py` (~90 checks incl. a full functional rebuild), full `verify.py` **11/11**.
+
+23. **فاز ۳ — استقرار روی Render + جداسازی Cloudflare** — the host was running `npx wrangler deploy` (log: «Could not detect a directory containing static files») because a root `package.json` + `wrangler.jsonc` made it look like a Node/Worker project. Moved `package.json`/`package-lock.json`/`wrangler.jsonc`/`Dockerfile`/`.dockerignore`/`worker/` into `deploy/cloudflare/` (optional, documented in its README); added root `render.yaml` (Python web service: build `pip install -r requirements.txt`, start `python bot.py`, `healthCheckPath: /health`, secrets `sync: false`); `config.py` += `port` field (env `PORT` overrides `WEBAPP_PORT` and widens bind to `0.0.0.0` when `WEBAPP_HOST` unset, via `model_fields_set`); `bot.py` warns when `PORT` is set with SQLite; `.gitignore` += `.venv/`; `.env.example` += `PORT`; `smoke_cloudflare.py` updated (paths + root-no-wrangler + render checks); README §3 = Render, §4 = optional Cloudflare; WEBHOOK.md updated. → full `verify.py` green.
+
+Git: two commits so far — `821db80 create project` (3701 files incl. `venv/`; the junk was later unstaged as DELETIONS so `git diff --cached` counts ~3734 paths) and `8b08e45 change and fix bugs and add fichure`. Everything after `8b08e45` (webhook phase + Cloudflare Containers phase) is **NOT committed** — `git status` currently lists the modified project files plus untracked `Dockerfile`/`.dockerignore`/`wrangler.jsonc`/`worker/`/`package.json`/`README.md`/`WEBHOOK.md`/`smoke_webhook.py`/`smoke_cloudflare.py`. **The user commits, never commit yourself.** `.env`/`.env.bak`/`database.db`/`venv/`/`backups/`/`logs/`/`node_modules/`/`.wrangler/` are ignored — `git status` must never show them.
 
 ---
 
@@ -255,7 +321,10 @@ Git: single commit `821db80 create project` (3701 files incl. `venv/`); everythi
 
 | I want to… | Open |
 | --- | --- |
-| run every check at once | `venv\Scripts\python smoke\verify.py` (compile + import + all 7 smokes) |
+| run every check at once | `venv\Scripts\python smoke\verify.py` (compile + import + all 9 smokes → 11 steps) |
+| deploy (current: Render) | root `render.yaml`; `pip install -r requirements.txt` + `python bot.py`; env `RUN_MODE=webhook`, `WEBAPP_HOST=0.0.0.0`, `PORT` auto |
+| deploy to Cloudflare Containers (optional) | files under `deploy/cloudflare/` (`Dockerfile`/`wrangler.jsonc`/`worker/index.js`/`package.json`), design in SKILL §2c |
+| switch polling↔webhook / local no-SSL test | `RUN_MODE` + `WEBHOOK_*` in `.env`, `bot.py:run_webhook`, guide `WEBHOOK.md` |
 | change a price/reward | `utils/economy.py` + `handlers/admin.py` (`cb_cost_*`, `cb_rewards*`) + `database/models.py` `BotPolicy` |
 | gift coins / airdrop to users | `handlers/admin.py` §6 (`admin:gift*`, `_spawn_gift_notify`) + `keyboards/admin.py` (`admin_gift_*_kb`) + `utils/economy.py` (`add_coins` / `bulk_add_*`) |
 | add/fix proxy support | `config.py:proxy_url`, `bot.py:build_session` / `_fallback_to_direct` / `log_connection_advice`, `test_connection.py` |

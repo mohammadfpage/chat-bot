@@ -12,6 +12,7 @@ backups/
 
 # Python
 venv/
+.venv/
 __pycache__/
 *.pyc
 *.pyo
@@ -19,6 +20,10 @@ __pycache__/
 
 # Runtime output
 logs/
+
+# Node (Cloudflare worker tooling)
+node_modules/
+.wrangler/
 
 # Editor / agent tooling
 .opencode/node_modules/

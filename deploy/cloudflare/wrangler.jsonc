@@ -1,0 +1,84 @@
+// OPTIONAL / NOT the current deployment path.
+//
+// Cloudflare Containers config. The current deployment is an ordinary Python
+// Web Service (Render, see README.md) and must NOT run `npx wrangler deploy`.
+// This file lives outside the repo root on purpose so no platform auto-detects
+// a Worker project. See deploy/cloudflare/README.md to restore this option.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "anon-chat-bot",
+  "main": "worker/index.js",
+  "compatibility_date": "2026-10-08",
+
+  // Exactly ONE instance: pair_map/search_queue/last_mode live in process
+  // RAM (handlers/chat.py), so two containers would never see each other's
+  // users. rebuild_chat_state() restores them from chat_pairs on every wake.
+  "containers": [
+    {
+      "class_name": "BotContainer",
+      "image": "./Dockerfile",
+      "max_instances": 1
+    }
+  ],
+
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "BOT_CONTAINER",
+        "class_name": "BotContainer"
+      }
+    ]
+  },
+
+  // New-style declaration of the Durable Object class above (cannot be
+  // combined with the legacy `migrations` array).
+  "exports": {
+    "BotContainer": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  },
+
+  // Non-secret settings — copied into the container env by the
+  // BotContainer constructor (worker/index.js) on every start.
+  // SECRETS ARE NOT HERE: they go through `npx wrangler secret put <NAME>`
+  // so they never touch git —
+  //   BOT_TOKEN, DATABASE_URL, WEBHOOK_SECRET, REDIS_URL, PROXY_URL
+  // Secrets must be set BEFORE the first deploy (the bot exits with a clear
+  // message if BOT_TOKEN or DATABASE_URL is missing) and re-put + redeploy
+  // to rotate.
+  "vars": {
+    "RUN_MODE": "webhook",
+    "WEBHOOK_PATH": "/telegram/webhook",
+
+    // Public https origin Telegram POSTs to — the workers.dev URL printed
+    // by the FIRST `wrangler deploy`. Empty on purpose: the bot fails fast
+    // with instructions instead of registering a broken webhook. Set it,
+    // then deploy again (see README.md → Cloudflare).
+    "WEBHOOK_BASE_URL": "",
+
+    // Must be 0.0.0.0: the Worker reaches the port through the container
+    // network, not through localhost.
+    "WEBAPP_HOST": "0.0.0.0",
+    "WEBAPP_PORT": "8080",
+
+    // Comma-separated Telegram ids — EDIT before deploying or nobody gets
+    // the admin panel (bot.py logs a warning and continues).
+    "ADMIN_IDS": "7174138646",
+    "CHANNEL_ID": "0",
+    "CHANNEL_USERNAME": "",
+
+    // Containers have no disk worth keeping: stdout only.
+    "LOG_FILE": "",
+    "LOG_LEVEL": "INFO",
+
+    // No group sweep on a cold start — every wake would otherwise resend
+    // cleanup messages to every group. GroupKeyboardWatchMiddleware still
+    // clears a group's keyboard the first time the bot speaks there.
+    "GROUP_KEYBOARD_CLEANUP": "false"
+  },
+
+  "observability": {
+    "enabled": true
+  }
+}

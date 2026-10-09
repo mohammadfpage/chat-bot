@@ -248,6 +248,17 @@ async def cb_backup(callback: CallbackQuery) -> None:
     the *caller's private chat*, never to wherever the panel happens to be
     open — a panel opened in a group must not drop a full user dump there.
     """
+    # The whole script is built on sqlite3 against a fixed database.db path.
+    # On PostgreSQL it would either fail confusingly — or, far worse, happily
+    # copy a STALE database.db left over from the SQLite days and present it
+    # as the current backup. Real backups there need pg_dump.
+    if settings.database_dialect != "sqlite":
+        await callback.answer(
+            "ℹ️ پشتیبان‌گیری این دکمه فقط برای SQLite است؛ دیتابیس فعلی "
+            "PostgreSQL است. با pg_dump پشتیبان بگیرید.",
+            show_alert=True,
+        )
+        return
     await callback.answer("⏳ در حال ساخت پشتیبان…")
     try:
         path = await asyncio.to_thread(run_backup)

@@ -83,13 +83,14 @@ async def _to_main_menu(message: Message, state: FSMContext, note: str) -> None:
         return
 
     # Leaving the search queue is harmless and must not leak a stale entry —
-    # otherwise the user would still be sitting in ``search_queue`` and a later
-    # match would hand them a partner they already walked away from.
+    # otherwise the user would still be sitting in ``search_queue`` (and in
+    # the ``chat_pairs`` mirror, from which a restart would put them back)
+    # and a later match would hand them a partner they already walked away
+    # from. ``leave_search_queue`` does both halves.
     if current == ChatState.in_queue:
-        from handlers.chat import chat_lock, search_queue
+        from handlers.chat import leave_search_queue
 
-        async with chat_lock:
-            search_queue.pop(message.from_user.id, None)
+        await leave_search_queue(message.from_user.id)
 
     await state.clear()
     await state.set_state(ChatState.idle)
@@ -109,10 +110,9 @@ async def nav_start(message: Message, state: FSMContext) -> None:
     if await _blocked_by_live_session(message, await state.get_state()):
         return
 
-    from handlers.chat import chat_lock, search_queue
+    from handlers.chat import leave_search_queue
 
-    async with chat_lock:
-        search_queue.pop(message.from_user.id, None)
+    await leave_search_queue(message.from_user.id)
     await state.clear()
     await cmd_start(message, state)
 

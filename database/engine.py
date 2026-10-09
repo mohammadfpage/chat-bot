@@ -1,6 +1,11 @@
 """
 Async SQLAlchemy engine and session factory.
-Swap 'aiosqlite' for 'asyncpg' when moving to PostgreSQL.
+
+The backend is chosen entirely by ``settings.database_url``: SQLite for
+local dev (aiosqlite), PostgreSQL for the Cloudflare container (asyncpg).
+``engine_options()`` is the single place that knows which connect arguments
+each backend needs — database.engine, the smokes and the migration guard
+all derive their behaviour from it instead of re-checking the URL.
 """
 
 import logging
@@ -32,22 +37,51 @@ def _ident(name: str) -> str:
         raise ValueError(f"Unsafe SQL identifier rejected: {name!r}")
     return name
 
+# ── Engine options per backend ────────────────────────────
+def engine_options(url: str) -> dict:
+    """Return ``create_async_engine`` kwargs for the backend in ``url``.
+
+    Kept a pure function of the URL so tests (and ``smoke_cloudflare``) can
+    assert on the exact kwargs without instantiating an engine.
+
+    SQLite
+      ``timeout=30`` — aiosqlite waits for a locked file instead of failing
+      instantly: the long-polling loop plus background tasks briefly overlap
+      writers, and "database is locked" must never reach a user.
+
+    PostgreSQL
+      ``server_settings={"timezone": "UTC"}`` — ``func.now()`` inside a
+      transaction takes the session timezone; pinning it to UTC keeps that
+      value aligned with the naive-UTC timestamps Python writes with
+      ``datetime.now(timezone.utc).replace(tzinfo=None)`` (every
+      ``created_at`` in models.py), so retention cutoffs and Telegram-time
+      displays agree across the two writers.
+      The pool is sized for a container that may serve handlers, background
+      sweeps and the rebuild-on-wake at once; ``pool_recycle`` rotates
+      connections before typical idle-kill policies do.
+    """
+    if url.startswith("sqlite"):
+        return {"connect_args": {"timeout": 30}}
+    if url.startswith("postgres"):
+        return {
+            "connect_args": {"server_settings": {"timezone": "UTC"}},
+            "pool_size": 10,
+            "max_overflow": 20,
+            "pool_recycle": 1800,
+        }
+    return {}
+
 # ── Engine ──────────────────────────────────────────────
 # pool_pre_ping verifies connections before use (safe for all dialects).
-# When migrating to PostgreSQL, add pool_size=10, max_overflow=20 here.
 engine = create_async_engine(
     settings.database_url,
     echo=False,
     pool_pre_ping=True,
-    # aiosqlite: wait for a locked file instead of failing instantly — the
-    # long-polling loop plus background tasks can briefly overlap writers.
-    connect_args={"timeout": 30}
-    if settings.database_url.startswith("sqlite")
-    else {},
+    **engine_options(settings.database_url),
 )
 
 
-if settings.database_url.startswith("sqlite"):
+if settings.database_dialect == "sqlite":
     from sqlalchemy import event
 
     @event.listens_for(engine.sync_engine, "connect")

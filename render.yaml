@@ -1,0 +1,67 @@
+# Render Blueprint — Python Web Service (NOT a Cloudflare Worker).
+#
+# This is the CURRENT deployment path. Render builds a normal Python service,
+# installs requirements.txt and runs the bot directly with `python bot.py`.
+# It never runs Docker, `npx wrangler deploy`, or any Node tooling.
+#
+# Free plan notes (do not try to bypass these):
+#   * a free web service sleeps after ~15 minutes of inactivity; while it is
+#     asleep Telegram's webhook deliveries bounce and are retried by Telegram.
+#     The bot rebuilds its state from PostgreSQL/Redis on the next wake.
+#   * the free plan has NO persistent disk, so production MUST use managed
+#     PostgreSQL (DATABASE_URL). Do not point DATABASE_URL at SQLite.
+#
+# Secrets are marked `sync: false`: set their values in the Render dashboard
+# (Environment tab) — NEVER in this file or anywhere in the repository.
+
+services:
+  - type: web
+    name: anon-chat-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.6
+
+      # ── Run mode: the bot serves Telegram updates over webhook and binds
+      #    the platform-assigned PORT (Render injects PORT automatically). ──
+      - key: RUN_MODE
+        value: webhook
+      - key: WEBHOOK_PATH
+        value: /telegram/webhook
+      - key: WEBAPP_HOST
+        value: 0.0.0.0
+      # WEBHOOK_BASE_URL is set by you after the first deploy, e.g.
+      #   https://anon-chat-bot.onrender.com
+      # (marked as a secret below because it is instance-specific).
+
+      # ── Containers had no disk; keep stdout-only logging and skip the
+      #    on-start group keyboard sweep for a cleaner cold start. ──
+      - key: LOG_FILE
+        value: ""
+      - key: GROUP_KEYBOARD_CLEANUP
+        value: "false"
+
+      # ── Secrets / instance-specific values (set in the dashboard) ──
+      - key: BOT_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: WEBHOOK_BASE_URL
+        sync: false
+      - key: PROXY_URL
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: CHANNEL_ID
+        sync: false
+      - key: CHANNEL_USERNAME
+        sync: false

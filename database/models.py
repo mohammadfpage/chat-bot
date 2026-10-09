@@ -257,6 +257,66 @@ class AnonChatSession(Base):
         )
 
 
+class ChatPair(Base):
+    """Durable mirror of the matching chat's in-memory state.
+
+    ``handlers/chat.py`` keeps ``pair_map`` / ``search_queue`` / ``last_mode``
+    in RAM for speed — and on a laptop that is fine, because a restart is a
+    rare deliberate act. On Cloudflare Containers the process is stopped and
+    restarted by the platform (idle sleep, deploy, crash), so a RAM-only pair
+    means two people mid-conversation are silently unpaired and nobody is
+    told. This table is the write-through copy ``chat.py`` keeps so
+    ``rebuild_chat_state()`` can put the queue and the live pairs back on
+    wake.
+
+    Shape — deliberately ONE row per user, upserted, never deleted:
+
+        user_id     the owner of this row (PK, no autoincrement: it IS the id)
+        partner_id  who they are paired with right now, NULL otherwise
+        status      ``queued`` | ``paired`` | ``ended``
+        mode        the matching mode they last searched with
+                    (NULL = اتصال شانسی / random), kept even after ``ended``
+                    so «🔍 چت بعدی» repeats the right choice across restarts
+        gender      snapshot of ``users.gender`` at queue time — the queue
+                    stores it so the matcher never has to re-read a row per
+                    candidate, and the rebuild needs it for the same reason
+        opened_at   Unix epoch (seconds, written from Python) of the moment
+                    the pair was made — the expiry clock, restored as
+                    ``chat_opened_at`` so a restarted 23-hour-old chat still
+                    ends on time. Epoch rather than ``func.now()`` because
+                    SQLite and PostgreSQL disagree about what "now" means
+                    (naive local vs. timezone-aware), and the whole point of
+                    the column is one absolute instant both sides agree on.
+
+    Not retained: ``last_partner`` (who you just talked to) is deliberately
+    NOT rebuilt — a blocked or vanished partner would resurrect a «اتصال
+    مجدد» button that can only answer "no". ``rematch_offers`` /
+    ``_rematch_declined`` are likewise forgotten, which is the documented
+    restart behaviour they already had.
+
+    Rows are bounded by one-per-user and are NOT part of the retention purge:
+    an ``ended`` row costs ~60 bytes and carries the mode history a returning
+    user needs.
+    """
+
+    __tablename__ = "chat_pairs"
+
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    partner_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
+    status: Mapped[str] = mapped_column(
+        String(8), nullable=False, default="ended", index=True
+    )
+    mode: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    gender: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    opened_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    def __repr__(self) -> str:
+        return (
+            f"<ChatPair {self.user_id} -> {self.partner_id} "
+            f"status={self.status}>"
+        )
+
+
 class Whisper(Base):
     """A private message ("نجوا") addressed to ONE member of a group.
 
