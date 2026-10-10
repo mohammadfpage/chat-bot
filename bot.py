@@ -633,6 +633,7 @@ async def build_bot_and_dispatcher() -> tuple[Bot, Dispatcher]:
         navigation_router,
         keyboard_fix_router,
         admin_router,
+        support_router,
         whisper_router,
         anonymous_router,
         chat_router,
@@ -664,6 +665,12 @@ async def build_bot_and_dispatcher() -> tuple[Bot, Dispatcher]:
     # emergency /fix_keyboard command can never be swallowed mid-wizard.
     dp.include_router(keyboard_fix_router)
     dp.include_router(admin_router)
+    # support_router sits above the state-gated relay catch-alls for the same
+    # reason navigation_router does: during a live chat every text message is
+    # relayed to the partner, so the «🎧 پشتیبانی» label has to be claimed here
+    # first. Its entry handler refuses to open inside a live session (it just
+    # warns), so the partner is never stranded by a state swap.
+    dp.include_router(support_router)
     dp.include_router(whisper_router)
     dp.include_router(anonymous_router)
     dp.include_router(chat_router)

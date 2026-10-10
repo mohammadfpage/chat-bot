@@ -53,10 +53,10 @@ def check(name, cond, detail=""):
 panel = ka.admin_panel_kb(is_root=False)
 panel_data = cbs(panel)
 check("panel has admin:forcejoin", "admin:forcejoin" in panel_data)
-check("panel button count = 10", len(panel_data) == 10, panel_data)
+check("panel button count = 11", len(panel_data) == 11, panel_data)
 check("panel widths <= 2", max(widths(panel)) <= 2, widths(panel))
 panel_root = ka.admin_panel_kb(is_root=True)
-check("root panel button count = 12", len(cbs(panel_root)) == 12, cbs(panel_root))
+check("root panel button count = 13", len(cbs(panel_root)) == 13, cbs(panel_root))
 check("root widths <= 2", max(widths(panel_root)) <= 2, widths(panel_root))
 
 # ── 2. whisper keyboard: force-join buttons gone ──

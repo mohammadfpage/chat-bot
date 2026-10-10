@@ -83,6 +83,10 @@ PREMIUM_EMOJIS: Final[dict[str, tuple[str, str | None]]] = {
     "info": ("ℹ️", None),
     "question": ("❓", None),
     "faq": ("❓", None),
+    # Support tickets: a headset names "talk to the team", a ticket stub names
+    # the record itself — two different things, so they get two keys.
+    "support": ("🎧", None),
+    "ticket": ("🎟️", None),
 
     # ── Validation / status ───────────────────────────────────────────
     "check": ("✅", None),

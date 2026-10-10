@@ -37,7 +37,7 @@ $env:PYTHONIOENCODING='utf-8'; python bot.py
 
 - Config comes from `.env` (`config.py` → `settings`). Token in `.env`; `.env.example` documents every key.
 - No linter/test framework installed (no ruff/flake8/pyflakes/pytest). Verification = compile + import + smoke scripts.
-- **One command runs everything** (compileall → `import bot` → all 9 smokes, UTF-8, non-zero exit on any failure):
+- **One command runs everything** (compileall → `import bot` → all 11 smokes, UTF-8, non-zero exit on any failure):
 
 ```powershell
 $env:PYTHONIOENCODING='utf-8'; & "D:\Project\chat bot\venv\Scripts\python.exe" "D:\Project\chat bot\smoke\verify.py"
@@ -45,8 +45,10 @@ $env:PYTHONIOENCODING='utf-8'; & "D:\Project\chat bot\venv\Scripts\python.exe" "
 ```
 
 - Smokes live in **`smoke/`** (in-repo, path-relative — they work from anywhere):
-  - `smoke_handlers5.py` (28) — menu/panel/HTML-escape/FSM-coverage/dead-button audit across every handler
-  - `smoke_forcejoin.py` — root panel = 12 buttons, force-join fail-open, `_answer_join_prompt`
+  - `smoke_handlers5.py` (35) — menu/panel/HTML-escape/FSM-coverage/dead-button audit across every handler + `is_bot_control_text` relay guard
+  - `smoke_support.py` (41) — support tickets: templates/status helpers, user+admin keyboards, `/support` command wiring, router registration, and a sqlite round-trip (create → transcript → admin-read → answered/closed winner rules)
+  - `smoke_profile_edit.py` (41) — «✏️ ویرایش پروفایل»: `ProfileEdit` states, card/edit keyboards, handler registration, the `~StateFilter(ProfileSetup, ProfileEdit)` gender-collision guard, a source scan for no-Telegram-call-under-a-session, and a sqlite round-trip through `_finish_field_edit` (one field changed, others untouched)
+  - `smoke_forcejoin.py` — root panel = 13 buttons / non-root = 11, force-join fail-open, `_answer_join_prompt`
   - `smoke_phase2.py` (16) — BASE_DIR, sqlite URL, WAL, log redaction, `_hook` kwargs filter, backgrounded cleanup ("RuntimeError: hook exploded" is INTENTIONAL = 16/16)
   - `smoke_economy.py` (25) — atomic deduct, exact refunds, peek/record, free-whisper exploit
   - `smoke_gift.py` — gift scope/confirm/bulk + `cb_gift_confirm`-before-prefix registration order
@@ -146,7 +148,7 @@ config.py           pydantic-settings Settings (all .env keys) + admin_ids parsi
 filters.py          IsAdmin / IsRootAdmin / IsProfileComplete / IsBanned
 test_connection.py  standalone reachability probe (direct / PROXY_URL / getMe)
 database/           models (incl. ChatPair mirror), engine (init_db migration + engine_options), session factory
-handlers/           all aiogram routers (12 files)
+handlers/           all aiogram routers (13 files)
 keyboards/          reply.py, inline.py, admin.py, user.py, __init__.py
 middleware/         admin_guard, force_join, keyboard_guard, group_*_watch
 states/fsm.py       all FSM StatesGroups
@@ -173,11 +175,12 @@ deploy/cloudflare/  OPTIONAL Cloudflare Containers files, kept OUT of the repo r
 | `anon_chat.py` | Real-time anonymous 1-on-1 session (request→active→ended), DB-backed | `cb_start_anon_chat`, `cb_anon_chat_accept`, `relay_to_partner` |
 | `navigation.py` | `/start`, `/menu`, «بازگشت» — must be first among menu routers | `nav_menu`, `nav_start`, `nav_back_to_menu` |
 | `keyboard_fix.py` | `/fix_keyboard` — clears a stuck reply keyboard, **open to any group member** | `cmd_fix_keyboard` |
-| `admin.py` (63 KB) | Whole admin panel; router-wide `IsAdmin()` + `IsRootAdmin()` on root-only | `cb_stats`, `cb_broadcast_*`, `cb_cost_*`, `cb_limits*`, `cb_gift_*`, `cb_manage_admins` |
+| `admin.py` | Whole admin panel; router-wide `IsAdmin()` + `IsRootAdmin()` on root-only; **support-ticket inbox** (§3b: `cb_support_*`, `admin_support_send_reply`, `_render_admin_ticket`) | `cb_stats`, `cb_broadcast_*`, `cb_cost_*`, `cb_limits*`, `cb_gift_*`, `cb_manage_admins` |
+| `support.py` | User side of «🎧 پشتیبانی»: open card, write/follow-up, history + transcript; `deliver_team_reply` DM shared with the panel | `open_support`, `cb_support_*`, `submit_support_message` |
 | `whisper.py` (59 KB) | `/نجوا` command flow, private-chat whisper, body collection | `cmd_whisper`, `whisper_collect_body`, `cb_whisper_view` |
 | `anonymous.py` | Guest inbox / hybrid async+real-time anon chat | `show_inbox`, `cb_inbox_open`, `cb_anon_block` |
 | `chat.py` | Matching + relay: `pair_map`/`search_queue` in memory, 24h lifetime, reports | `start_search`, `forward_text`, `end_chat`, `report_user` |
-| `profile.py` | Profile FSM, profile view, blocked list, wallet (coins, daily bonus, referral) | `process_age/city/gender/height`, `wallet_daily_bonus`, `show_profile` |
+| `profile.py` | Profile FSM, profile view (+ «✏️ ویرایش پروفایل» field picker = `ProfileEdit`), blocked list, wallet (coins, daily bonus, referral) | `process_age/city/gender/height`, `show_profile`, `_send_profile_card`, `cb_profile_edit`, `edit_age/city/gender/height/photo`, `wallet_daily_bonus` |
 | `start.py` | `/start`, deep links, `/help`, `/inline`, admin dual-panel | `cmd_start`, `cmd_help`, `cmd_inline_help` |
 | `inline_menu.py` | The 3-option bare `@bot` picker (tutorial / نجوا / ناشناس) | `on_inline_query` articles |
 
@@ -195,6 +198,7 @@ deploy/cloudflare/  OPTIONAL Cloudflare Containers files, kept OUT of the repo r
 | `target_lookup.py` | Single place that resolves a whisper recipient (used by `/نجوا` and inline picker) |
 | `membership.py` | Shared "is user in channel/group?" checks (force-join + whisper send/view) |
 | `whisper_config.py` | Single-row `whisper_config` accessor with cache |
+| `support.py` | Support-ticket status values (`STATUS_OPEN/ANSWERED/CLOSED`, `status_label`, `status_from_filter`) + the user-facing card/reply templates (`support_home_text`, `support_reply_text`, …) — ONE source so greeting/thanks can't drift |
 | `chat_types.py` | Group/private predicates shared by keyboard guard + cleanup |
 | `helpers.py` | `format_user_profile` (HTML-escaped), `RateLimiter`, text formatting |
 | `db_config.py` | **DEPRECATED**, delegates to `config.py` |
@@ -212,7 +216,7 @@ Plus **session-level** `install_keyboard_guard(bot)` — wraps the Bot session s
 
 ### database/
 
-- `models.py` — `User`, `BlockList` (+ `UserReport` for the report inbox; `BlockList` has no `created_at`), `AnonymousContact`, `AnonymousMessage`, `AnonChatSession`, `Whisper`, `InlineWhisper`, `GroupChat`, `GroupRoster`, `WhisperConfig`, `RequiredChannel`, `BotPolicy`, `CoinTransaction`.
+- `models.py` — `User`, `BlockList` (+ `UserReport` for the report inbox; `BlockList` has no `created_at`), `SupportTicket`/`SupportMessage` (answerable support conversations; ticket `status` = open/answered/closed, `updated_at` float-to-top, message `is_read` drives the panel's unread badge), `AnonymousContact`, `AnonymousMessage`, `AnonChatSession`, `Whisper`, `InlineWhisper`, `GroupChat`, `GroupRoster`, `WhisperConfig`, `RequiredChannel`, `BotPolicy`, `CoinTransaction`.
 - `engine.py` — `create_async_engine`, `async_session_factory`, `init_db()` (create tables + **startup migrations** for legacy columns), `get_session()`.
 - Raw SQL exists **only** in `init_db()`, guarded by `_ident()`/`_IDENT = [A-Za-z_][A-Za-z0-9_]*` — never route user input through f-string SQL.
 
@@ -225,10 +229,11 @@ Plus **session-level** `install_keyboard_guard(bot)` — wraps the Bot session s
 1. `Bot(token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))` ← **global HTML**
 2. `install_keyboard_guard(bot)` (session-level)
 3. middlewares in the order of §3
-4. routers **specific → general**: `group_lifecycle → inline_anon → anon_chat → navigation → keyboard_fix → admin → whisper → anonymous → chat → profile → start`
+4. routers **specific → general**: `group_lifecycle → inline_anon → anon_chat → navigation → keyboard_fix → admin → support → whisper → anonymous → chat → profile → start`
    - `inline_anon` first so state-gated catch-alls don't swallow the reply to an inline card.
    - `anon_chat` before menu routers (bare message handler with its own SkipHandler bail-out).
    - `navigation` first among *menu* routers; `keyboard_fix` above every state-gated catch-all.
+   - `support` above the state-gated relay catch-alls (like `navigation`): the «🎧 پشتیبانی» label must be claimed before `chat`/`anonymous` relay it. Its entry refuses to open inside a live session (warns instead) so it never swaps a live session's FSM state and strands a partner.
 5. startup hooks in this order: **`rebuild_chat_state` (FIRST — everything else assumes the maps are real)** → group keyboard cleanup → `start_roster_sync` → `start_persistence` → `start_chat_expiry` → `start_retention`; matching shutdowns.
 6. `dp.workflow_data["dp"]`, `["storage"]` for handlers/startup callbacks.
 
@@ -317,6 +322,12 @@ Plus **session-level** `install_keyboard_guard(bot)` — wraps the Bot session s
 
 24. **فاز ۴ — اجرای Cloudflare از ریشهٔ ریپو + secretهای لوکال + هلپر وبهوک** — `npx wrangler dev` از ریشه با خطای `Missing entry-point to Worker script` می‌افتاد چون کانفیگ داخل `deploy/cloudflare/` است. اصلاحات: (الف) `wrangler.jsonc` حالا `containers[0].image_build_context = "../.."` دارد → context داکر = ریشهٔ ریپو، پس Dockerfile **in-place** بیلد می‌شود (نیاز به کپی فایل‌ها به ریشه نیست)؛ `wrangler` مقدار `image`/`image_build_context` را نسبت به **پوشهٔ فایل کانفیگ** حل می‌کند (از سورس wrangler تأیید شد: `path.resolve(dirname(configPath), …)`)، بنابراین `npx wrangler deploy/dev/tail -c deploy/cloudflare/wrangler.jsonc` از ریشه کار می‌کند. (ب) `.dockerignore` **ریشه** ساخته شد (چون با context=ریشه، داکر همان را می‌خواند): `.env`, `.dev.vars`, `venv/`, `*.db`, `backups/`, `**/node_modules/` و… بیرون از image. (ج) `deploy/cloudflare/package.json` اسکریپت‌های `cf:dev/cf:deploy/cf:tail/cf:secret/cf:check` (همه با `-c wrangler.jsonc`) گرفت؛ اجرا از ریشه: `npm --prefix deploy/cloudflare run cf:dev`. (د) `.dev.vars.example` (الگو، commit می‌شود) + `.dev.vars` تولیدشده از `.env` ریشه (git-ignored؛ `BOT_TOKEN` واقعی، `WEBHOOK_SECRET` تصادفیِ valid، `RUN_MODE=webhook`, `ADMIN_IDS`, `DATABASE_URL` لوکال SQLite، `WEBHOOK_BASE_URL` خالی)؛ wrangler این فایل را از **پوشهٔ کانفیگ** می‌خواند (`path.resolve(configDir, ".dev.vars")` از سورس)، پس هم با `-c` از ریشه و هم از داخل پوشه load می‌شود. `.gitignore` += `.dev.vars`/`.dev.vars.*` + `!.dev.vars.example`. (ه) `deploy/cloudflare/set_webhook.py` — هلپری که `build_webhook_url`/`build_set_webhook_kwargs` خودِ پروژه را ایمپورت می‌کند تا `allowed_updates` (شامل `chat_member`) از dispatcher ساخته شود؛ فلگ‌های `--url`/`--secret`/`--print-curl`/`--remove`؛ اگر `WEBHOOK_SECRET` خالی باشد عمداً خطا می‌دهد (secret تصادفیِ هر بوت با Worker نمی‌خواند → ۴۰۱). (و) Docs: `deploy/cloudflare/README.md` بازنویسی (دستورات `-c` + npm scripts + چک‌لیست + invariantها)، README §۴ و WEBHOOK.md §۳ آپدیت، Dockerfile/`.dockerignore` کامنت‌ها اصلاح. **⚠️ واقعیت مهم:** Containers فقط روی **Workers Paid (‏$5/ماه)** است (`Free: N/A` در pricing اوت ۲۰۲۶) — «free tier» برای این معماری ممکن نیست. → `smoke_cloudflare.py` +~25 بررسی (image_build_context، root .dockerignore، dev.vars.example، cf:* scripts، `set_webhook._resolve_url`)، full `verify.py` 11/11 سبز؛ `cf:check` از ریشه خروجی 54 KiB می‌دهد.
 
+25. **رفع نشتی دکمه‌ها در چت ناشناس** — باگ: در حالت گفتگوی ناشناس (هم inbox `handlers/anonymous.py::AnonChatStates.in_session` و هم real-time `handlers/anon_chat.py`)، اگر کاربر فراموش می‌کرد چت را ببندد و یکی از دکمه‌های منوی ربات را می‌زد، متن دکمه به عنوان پیام عادی برای طرف مقابل relay/ذخیره می‌شد. اصلاح: در `keyboards/reply.py` یک ست `BOT_CONTROL_TEXTS` (همهٔ لیبل‌های کنترلی reply-keyboard، به‌جز مقادیری مثل سن/شهر که پیام واقعی‌اند) + هلپر `is_bot_control_text(text)` (شروع با `/` یا عضویت در ست) اضافه شد و از `keyboards` export شد. `anonymous.py::anon_message_router` حالا قبل از relay با `is_bot_control_text` چک می‌کند و در صورت true پیام «ابتدا با «❌ پایان چت / بازگشت» گفتگو را ببندید» می‌دهد و relay نمی‌کند (دکمهٔ خروج در باگ قبلی handle می‌شود). `anon_chat.py::relay_to_partner` هم شرط قبلی (فقط `/` و `BACK_TO_MENU_TEXTS`) با `is_bot_control_text` جایگزین شد تا با `SkipHandler` به هندلر خودش بدهد؛ import قدیمی `BACK_TO_MENU_TEXTS` حذف شد. کامنت قدیمی `start.py::cmd_inline_help` که ادعا می‌کرد لیبل‌های منو در چت فعال relay می‌شوند به‌روز شد. → `smoke_handlers5.py` 28→35 (بررسی پوشش لیبل‌ها + فیلتر هر دو relay).
+
+26. **سیستم پشتیبانی (تیکت قابل‌پاسخ)** — قابلیت جدید «🎧 پشتیبانی»: کاربر از منوی اصلی (یا `/support`) وارد می‌شود، پیام می‌نویسد و تیم در همان گفتگو جواب می‌دهد؛ ادمین‌ها تیکت‌های «در انتظار پاسخ» را از «پاسخ‌داده‌شده» جدا می‌بینند و همه‌چیز قابل پیگیری است. **مدل‌ها** (`database/models.py`): `SupportTicket` (جدول `support_tickets`: `user_id`, `status`, `created_at`, `updated_at`) + `SupportMessage` (جدول `support_messages`: `ticket_id`, `sender_id`, `is_admin`, `content`, `is_read`). وضعیت‌ها: `open` (کاربر آخر نوشته)، `answered` (تیم جواب داده)، `closed` (بایگانی؛ پیام بعدی **تیکت جدید** می‌سازد — `_winner_ticket` فقط `open` را برمی‌گرداند). `updated_at` روی هر پیام جلو می‌رود تا لیست بر اساس «آخرین تماس» مرتب شود. **قالب‌ها** در `utils/support.py` (تک‌منبع): `status_label`/`status_from_filter` + متن‌ها؛ پاسخ تیم = `support_reply_text` = «سلام» + متن ادمین (`escape`شده) + «سپاس‌گزاریم» — دقیقاً همان ساختار درخواست‌شده، پس greeting/thanks هرگز از هم جدا نمی‌شوند. **سمت کاربر** `handlers/support.py` (`support_router`): `open_support` (دکمهٔ منو + `/support`) کارت خانه می‌دهد؛ `support:write` حالت `SupportStates.waiting_for_message` را با پرامپت + `main_menu_kb()` مسلح می‌کند (لغو = دکمهٔ «🏠 منوی اصلی» که `navigation` هندل می‌کند)؛ `submit_support_message` پیام را به تیکت `open` می‌چسباند یا تیکت جدید می‌سازد؛ `support:history`/`support:view:{id}` فهرست و متن گفتگو؛ `support:back` منوی اصلی را برمی‌گرداند. پیام جدید به **همهٔ** ادمین‌ها (ریشه + ارتقایی) با دکمهٔ `admin:support:open:{id}` پینگ می‌شود. `deliver_team_reply` (DM با قالب + منوی اصلی) بین این فایل و پنل مشترک است. **سمت ادمین** در `handlers/admin.py` §۳ب: `admin:support` (شمارش هر سبد)، `admin:support:list:{open|answered|all}:{page}` (فهرست صفحه‌بندی‌شده ۸تایی با برچسب وضعیت + نشانگر 🔴 پیام خوانده‌نشده)، `admin:support:open:{id}` (متن + علامت‌گذاری خوانده‌شده)، `admin:support:reply:{id}` (حالت `AdminSupport.waiting_for_reply`)، `admin_support_send_reply` (ذخیره + ارسال DM + وضعیت `answered`)، `admin:support:close|reopen:{id}`. **کلیدواژه‌ها**: `SUPPORT_LABEL="🎧 پشتیبانی"` در `keyboards/reply.py` (منوی اصلی ردیف ۵ کنار «📖 راهنما») و به `BOT_CONTROL_TEXTS` **و** `whisper._MENU_ESCAPE_TEXTS` اضافه شد؛ `support_router` در `bot.py` **بالای** catch-allهای relay و بعد از `admin` ثبت شد و ورودش داخل چت/سشن ناشناس فعال را رد می‌کند (فقط هشدار می‌دهد) تا state جلسهٔ زنده را عوض نکند و طرف مقابل بی‌پاسخ نماند. `/support` به `PRIVATE_COMMANDS` + کارت `/help` اضافه شد. → `smoke_support.py` (41) + `smoke_handlers5.py` 35 + `smoke_forcejoin.py` (پنل ۱۰→۱۱، ریشه ۱۲→۱۳)؛ کل `verify.py` **12/12**.
+
+27. **ویرایش پروفایل (بخش «✏️ ویرایش پروفایل»)** — زیر کارت «👤 پروفایل من» یک دکمهٔ اینلاین «⚙️ ویرایش پروفایل» اضافه شد که یک منوی انتخاب فیلد باز می‌کند. هر فیلد مستقل ویرایش می‌شود (سن/شهر/جنسیت/قد/عکس) و بلافاصله ذخیره می‌شود — بدون تکرار کل ویزارد. **حالت‌ها** (`states/fsm.py`): `ProfileEdit` با `waiting_for_age/city/gender/height/photo` (صادرشده از `states`). **صفحه‌کلیدها** (`keyboards/user.py`): `profile_card_kb()` (`profile:edit`) و `profile_edit_kb()` (`profile:edit:{age,city,gender,height,photo}` + `profile:edit:back`)؛ هر دو صادرشده از `keyboards`. **هندلرها** (`handlers/profile.py`): کارت پروفایل حالا از تابع مشترک `_send_profile_card` ساخته می‌شود (متن/عکس با دکمهٔ ویرایش اینلاین به‌جای ریپلای‌کیبورد)، `cb_profile_edit` منو را ویرایش می‌کند (روی کارت عکسی fallback به ارسال پیام جدید)، `cb_edit_<field>` حالت را ست و صفحه‌کلید همان فیلد (`age_kb`/`city_kb`/`gender_kb`/`height_kb`/`profile_photo_choice_kb`) را می‌فرستد، پیام بعدی در `edit_<field>` اعتبارسنجی و با `_finish_field_edit` ذخیره می‌شود (سشن DB بسته می‌شود، سپس «✅ تغییرات ذخیره شد» + `main_menu_kb()` + رندر مجدد کارت). لغو = `_cancel_field_edit`. **نکتهٔ حیاتی:** فیلتر `set_gender_standalone` از `~StateFilter(ProfileSetup)` به `~StateFilter(ProfileSetup, ProfileEdit)` تغییر کرد، وگرنه پاسخ «👩 زن/👨 مرد» در حالت ویرایش را می‌بلعید. از `_profile_photo_file_id`/`_send_profile_card` مشترک استفاده می‌شود تا کارت قبل و بعد از ویرایش یکی باشد. → `smoke/smoke_profile_edit.py` (41) به `verify.py` اضافه شد؛ همهٔ ۱۳ مرحله سبز.
+
 Git: سه کامیت — `821db80 create project`, `8b08e45 change and fix bugs and add fichure`, `1e4df1f change to congig the ..` (شامل فازهای webhook + Cloudflare Containers + Render). **همه‌چیز تا `1e4df1f` کامیت و push شده.** تغییرات این فاز (۲۴) هنوز کامیت نشده: modified `.gitignore`/`README.md`/`WEBHOOK.md`/`deploy/cloudflare/{.dockerignore,Dockerfile,README.md,package.json,wrangler.jsonc}`/`smoke/smoke_cloudflare.py` + untracked root `.dockerignore`, `deploy/cloudflare/.dev.vars.example`, `deploy/cloudflare/set_webhook.py`. **The user commits, never commit yourself.** `.env`/`.env.bak`/`database.db`/`venv/`/`backups/`/`logs/`/`node_modules/`/`.wrangler/`/**`deploy/cloudflare/.dev.vars`** are ignored — `git status` must never show them.
 
 ---
@@ -339,7 +350,7 @@ Git: سه کامیت — `821db80 create project`, `8b08e45 change and fix bugs 
 
 | I want to… | Open |
 | --- | --- |
-| run every check at once | `venv\Scripts\python smoke\verify.py` (compile + import + all 9 smokes → 11 steps) |
+| run every check at once | `venv\Scripts\python smoke\verify.py` (compile + import + all 11 smokes → 13 steps) |
 | deploy (current: Render) | root `render.yaml`; `pip install -r requirements.txt` + `python bot.py`; env `RUN_MODE=webhook`, `WEBAPP_HOST=0.0.0.0`, `PORT` auto |
 | deploy to Cloudflare Containers (optional) | files under `deploy/cloudflare/` (design in SKILL §2c); from the repo root: `npm install --prefix deploy/cloudflare` → `npm --prefix deploy/cloudflare run cf:check` / `cf:dev` / `cf:deploy` (or `npx wrangler … -c deploy/cloudflare/wrangler.jsonc`); needs Workers Paid + Docker daemon |
 | local Cloudflare secrets | `deploy/cloudflare/.dev.vars.example` → copy to `.dev.vars` (git-ignored, read from the config dir by wrangler) |

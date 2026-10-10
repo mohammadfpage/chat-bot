@@ -12,6 +12,23 @@ class ProfileSetup(StatesGroup):
     waiting_for_photo = State()
 
 
+class ProfileEdit(StatesGroup):
+    """Editing ONE field of an already-complete profile.
+
+    One state per editable field (not a re-run of :class:`ProfileSetup`), so the
+    text or photo the user sends lands on exactly the field they picked in the
+    «ویرایش پروفایل» menu. The setup wizard's states cannot be reused here: they
+    chain age → city → gender → height and would force the user through every
+    step just to change one value.
+    """
+
+    waiting_for_age = State()
+    waiting_for_city = State()
+    waiting_for_gender = State()
+    waiting_for_height = State()
+    waiting_for_photo = State()
+
+
 class ChatState(StatesGroup):
     """Three-state machine for chat lifecycle."""
     idle = State()
@@ -78,6 +95,27 @@ class AdminReport(StatesGroup):
     """
 
     waiting_for_user_id = State()
+
+
+class SupportStates(StatesGroup):
+    """User composing a message to the support team.
+
+    ``waiting_for_message`` — the «🎧 پشتیبانی» screen asked for text; the next
+    message the user sends becomes a new ticket (or a follow-up to their open
+    one).
+    """
+
+    waiting_for_message = State()
+
+
+class AdminSupport(StatesGroup):
+    """Admin composing a reply to one support ticket.
+
+    State data:
+        ticket_id: int - which ticket the next typed text answers
+    """
+
+    waiting_for_reply = State()
 
 
 class AnonChatStates(StatesGroup):

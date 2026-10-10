@@ -46,6 +46,8 @@ from keyboards.inline import (
     ICON_INFO,
     ICON_JOIN,
     ICON_LINK,
+    ICON_OPTIONS,
+    ICON_REPLY,
     add_to_group_link,
 )
 
@@ -56,6 +58,11 @@ __all__ = [
     "wallet_kb",
     "wallet_history_kb",
     "rematch_offer_kb",
+    "profile_card_kb",
+    "profile_edit_kb",
+    "support_menu_kb",
+    "support_history_kb",
+    "support_ticket_kb",
 ]
 
 
@@ -200,6 +207,145 @@ def rematch_offer_kb() -> InlineKeyboardMarkup:
         text=f"{ICON_DECLINE} رد درخواست",
         callback_data="rematch:decline",
         style="danger",
+    )
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+# ──────────────────────────────────────────────────
+# Profile  (own card + «✏️ ویرایش پروفایل» section)
+# ──────────────────────────────────────────────────
+
+def profile_card_kb() -> InlineKeyboardMarkup:
+    """The single «✏️ ویرایش پروفایل» button under the user's own profile card.
+
+    Inline rather than a reply button so it sits directly beneath the card —
+    the reply menu, which is persistent, stays on screen at the same time.
+
+    Layout:
+        [✏️ ویرایش پروفایل]
+    """
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text=f"{ICON_OPTIONS} ویرایش پروفایل",
+        callback_data="profile:edit",
+        style="primary",
+    )
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def profile_edit_kb() -> InlineKeyboardMarkup:
+    """The «ویرایش پروفایل» section: one button per editable field.
+
+    Every field gets its own row button so the user edits exactly one value and
+    nothing else changes — the whole point of the picker over re-running the
+    setup wizard.
+
+    Layout:
+        [🎂 سن]         [🏙 شهر]
+        [🚻 جنسیت]      [📏 قد]
+        [🖼 عکس پروفایل]
+        [🔙 بازگشت]
+    """
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🎂 سن", callback_data="profile:edit:age", style="primary")
+    builder.button(text="🏙 شهر", callback_data="profile:edit:city", style="primary")
+    builder.button(
+        text="🚻 جنسیت", callback_data="profile:edit:gender", style="primary"
+    )
+    builder.button(text="📏 قد", callback_data="profile:edit:height", style="primary")
+    builder.button(
+        text="🖼 عکس پروفایل", callback_data="profile:edit:photo", style="primary"
+    )
+    builder.button(
+        text=f"{ICON_BACK} بازگشت", callback_data="profile:edit:back", style="primary"
+    )
+    builder.adjust(2, 2, 1, 1)
+    return builder.as_markup()
+
+
+# ──────────────────────────────────────────────────
+# Support  («🎧 پشتیبانی»)
+# ──────────────────────────────────────────────────
+
+def support_menu_kb(*, has_history: bool = False) -> InlineKeyboardMarkup:
+    """The support home card.
+
+    Layout:
+        [💬 نوشتن پیام]                 (always — the primary action)
+        [📜 پیگیری‌های من]               (only when the user has any ticket)
+        [🔙 بازگشت به منوی اصلی]
+
+    The history row is hidden for a first-time visitor: an empty list is not a
+    destination, and showing it would make a two-button card look like it has a
+    dead option.
+    """
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text=f"{ICON_CHAT} نوشتن پیام",
+        callback_data="support:write",
+        style="success",
+    )
+    if has_history:
+        builder.button(
+            text=f"{ICON_HISTORY} پیگیری‌های من",
+            callback_data="support:history",
+            style="primary",
+        )
+    builder.button(
+        text=f"{ICON_BACK} بازگشت به منوی اصلی",
+        callback_data="support:back",
+        style="primary",
+    )
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def support_history_kb(rows: list[tuple[int, str]]) -> InlineKeyboardMarkup:
+    """One button per past ticket + a way home.
+
+    ``rows`` is ``[(ticket_id, label), …]`` built by the handler, because only
+    the handler knows the peer's status text and date.
+    """
+    builder = InlineKeyboardBuilder()
+    for ticket_id, label in rows:
+        builder.button(
+            text=label,
+            callback_data=f"support:view:{ticket_id}",
+            style="primary",
+        )
+    builder.button(
+        text=f"{ICON_BACK} بازگشت",
+        callback_data="support:home",
+        style="primary",
+    )
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def support_ticket_kb() -> InlineKeyboardMarkup:
+    """Under a ticket transcript: follow up, or step back.
+
+    «ادامهٔ گفتگو» is deliberately the same action as the home card's
+    «نوشتن پیام» — a reply to an answered ticket is just the next message, and
+    pretending otherwise would need a second, near-identical flow.
+    """
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text=f"{ICON_REPLY} ادامهٔ گفتگو",
+        callback_data="support:write",
+        style="success",
+    )
+    builder.button(
+        text=f"{ICON_HISTORY} پیگیری‌های من",
+        callback_data="support:history",
+        style="primary",
+    )
+    builder.button(
+        text=f"{ICON_BACK} بازگشت",
+        callback_data="support:home",
+        style="primary",
     )
     builder.adjust(1)
     return builder.as_markup()

@@ -53,12 +53,12 @@ from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 from keyboards import (
     ANON_REQUEST_CB_PREFIX,
     ANON_SESSION_END_LABEL,
-    BACK_TO_MENU_TEXTS,
     anon_chat_decision_kb,
     anon_chat_open_kb,
     anon_chat_request_kb,
     anon_chat_session_kb,
     anon_chat_waiting_kb,
+    is_bot_control_text,
     main_menu_kb,
 )
 from keyboards.reply import anon_session_menu_kb
@@ -531,14 +531,15 @@ async def relay_to_partner(message: Message, bot: Bot) -> None:
     if row is None:
         raise SkipHandler
 
-    # Any command and the main-menu label are the user's escape hatch: they
-    # belong to the routers below, and swallowing somebody's /menu because they
-    # wanted to see the menu would make the session a trap. Checking the slash
-    # rather than listing command names also covers ``/start@bot <payload>``,
-    # which is how a deep link arrives.
-    if message.text and (
-        message.text.startswith("/") or message.text in BACK_TO_MENU_TEXTS
-    ):
+    # Any command or bot control label is the user's escape hatch, never chat
+    # text: it belongs to the routers below, so it must be carried through with
+    # SkipHandler. Two bugs would appear without this. Swallowing somebody's
+    # /menu would make the session a trap; and relaying a main-menu label the
+    # user still has on screen from before the session started would leak the
+    # button text to the stranger as if it were a message. The control set
+    # includes the slash-command check, which also covers ``/start@bot
+    # <payload>`` deep links.
+    if is_bot_control_text(message.text):
         raise SkipHandler
 
     content_type = message.content_type

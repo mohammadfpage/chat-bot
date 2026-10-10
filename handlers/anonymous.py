@@ -22,7 +22,12 @@ from aiogram.types import CallbackQuery, Message
 from sqlalchemy import select, func as sql_func
 
 from database import async_session_factory, AnonymousMessage, BlockList
-from keyboards import main_menu_kb, anonymous_chat_menu_kb, unread_inbox_kb
+from keyboards import (
+    main_menu_kb,
+    anonymous_chat_menu_kb,
+    is_bot_control_text,
+    unread_inbox_kb,
+)
 from states import AnonChatStates, ChatState
 from utils.economy import (
     authorize_chat_message,
@@ -378,6 +383,21 @@ async def anon_message_router(
 
     content = message.text.strip()
     if not content:
+        return
+
+    # A menu button or a /command is never chat text. This handler relays
+    # anything else to the partner, so without this guard a user who forgets to
+    # close the anonymous chat leaks the button label (or command) straight to
+    # the stranger on the other side. The «❌ پایان چت / بازگشت» button above is
+    # the one control this flow acts on instead of refusing.
+    if is_bot_control_text(content):
+        await message.answer(
+            "⚠️ <b>شما در یک گفتگوی ناشناس هستید.</b>\n\n"
+            "برای استفاده از دکمه‌های ربات ابتدا با «❌ پایان چت / بازگشت» "
+            "گفتگو را ببندید.",
+            parse_mode="HTML",
+            reply_markup=anonymous_chat_menu_kb(),
+        )
         return
 
     # Check if blocked by partner

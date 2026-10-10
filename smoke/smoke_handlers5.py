@@ -44,6 +44,30 @@ labels = [b.text for row in main_menu_kb().keyboard for b in row]
 missing = [l for l in labels if l not in hw._MENU_ESCAPE_TEXTS]
 check("every menu label escapes a parked whisper", not missing, missing)
 
+# ── 2b. live sessions refuse to relay bot buttons / commands ──────────────
+from keyboards import (  # noqa: E402
+    BOT_CONTROL_TEXTS,
+    is_bot_control_text,
+)
+
+check("every main-menu label is a control text", all(l in BOT_CONTROL_TEXTS for l in labels))
+check("a slash command is a control text", is_bot_control_text("/start"))
+check("a deep-linked command is a control text", is_bot_control_text("/start@bot x"))
+check("ordinary text is NOT a control text", not is_bot_control_text("سلام، چطوری؟"))
+check("empty text is NOT a control text", not is_bot_control_text(None))
+
+check(
+    "anon_message_router refuses control texts",
+    "is_bot_control_text" in inspect.getsource(ha.anon_message_router),
+)
+
+import handlers.anon_chat as hc  # noqa: E402
+
+check(
+    "relay_to_partner refuses control texts",
+    "is_bot_control_text" in inspect.getsource(hc.relay_to_partner),
+)
+
 # ── 3. _card / _fallback handle deleted & inaccessible cards ──────────────
 from aiogram.types import (  # noqa: E402
     CallbackQuery,

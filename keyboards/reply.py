@@ -35,6 +35,13 @@ BACK_TO_MENU_TEXTS = frozenset(
 #: it to its own "abandon the parked draft" escape set.
 INLINE_HELP_LABEL = "📨 پیام ناشناس اینلاین"
 
+#: Label of the main-menu button that opens the «🎧 پشتیبانی» ticket screen.
+#: Declared here for the same two reasons as ``INLINE_HELP_LABEL``: the
+#: ``F.text == …`` matcher in ``handlers.support`` and this keyboard must read
+#: one string, and whisper.py folds it into its parked-draft escape set so a
+#: user who taps it instead of sending the draft is not swallowed by the relay.
+SUPPORT_LABEL = "🎧 پشتیبانی"
+
 # ──────────────────────────────────────────────────
 # The three ways to get matched
 # ──────────────────────────────────────────────────
@@ -75,7 +82,7 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
     Row 2: [👤 پروفایل من] [📩 پیام‌های ناشناس من]
     Row 3: [🔗 لینک ناشناس من] [🏆 امتیازات و سکه]
     Row 4: [🎁 دعوت دوستان] [📨 پیام ناشناس اینلاین]
-    Row 5: [📖 راهنما و قوانین]
+    Row 5: [📖 راهنما و قوانین] [🎧 پشتیبانی]
     Row 6: [⛔️ لیست مسدودی‌ها (Danger)]
 
     Matching gets a whole row of its own because it is the one decision that
@@ -108,6 +115,7 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
             ],
             [
                 KeyboardButton(text="📖 راهنما و قوانین", style="primary"),
+                KeyboardButton(text=SUPPORT_LABEL, style="primary"),
             ],
             [
                 KeyboardButton(text="⛔️ لیست مسدودی‌ها", style="danger"),
@@ -406,3 +414,55 @@ def anon_session_menu_kb() -> ReplyKeyboardMarkup:
             [KeyboardButton(text=ANON_SESSION_END_LABEL, style="danger")],
         ],
     )
+
+
+# ──────────────────────────────────────────────────
+# Bot-control labels  (never user payload)
+# ──────────────────────────────────────────────────
+
+#: Every reply-keyboard label that is a CONTROL, not something a user would
+#: mean to type as chat text. A live anonymous session relays arbitrary text to
+#: a stranger, so a menu button tapped out of habit must never be delivered to
+#: the other side — that is the bug this set exists to close. Values that could
+#: plausibly be real content (age numbers, city names, height strings) are
+#: deliberately left out so a genuine message is never mistaken for a button.
+BOT_CONTROL_TEXTS = frozenset(
+    {
+        BACK_TO_MENU,
+        RANDOM_CONNECT_LABEL,
+        CHAT_WITH_GIRL_LABEL,
+        CHAT_WITH_BOY_LABEL,
+        INLINE_HELP_LABEL,
+        NEXT_CHAT_LABEL,
+        REMATCH_LABEL,
+        ANON_SESSION_END_LABEL,
+        "👤 پروفایل من",
+        "📩 پیام‌های ناشناس من",
+        "🔗 لینک ناشناس من",
+        "🏆 امتیازات و سکه",
+        "🎁 دعوت دوستان",
+        "📖 راهنما و قوانین",
+        SUPPORT_LABEL,
+        "⛔️ لیست مسدودی‌ها",
+        "❌ لغو جستجو",
+        "❌ لغو چت",
+        "🛑 گزارش کاربر / بلاک",
+        "❌ پایان چت / بازگشت",
+        "👑 پنل مدیریت",
+        "👤 پنل کاربری",
+    }
+)
+
+
+def is_bot_control_text(text: str | None) -> bool:
+    """True when ``text`` is a ``/command`` or a bot control label.
+
+    Live anonymous sessions funnel every message to a stranger. The relay
+    handlers call this to refuse a menu button or a command, so a user who
+    forgets to close the chat cannot leak the button text (or a command) to the
+    other side. Command detection is by the leading slash, which also covers
+    ``/start@bot <payload>`` deep links.
+    """
+    if not text:
+        return False
+    return text.startswith("/") or text in BOT_CONTROL_TEXTS

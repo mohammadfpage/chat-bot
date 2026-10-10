@@ -587,9 +587,11 @@ async def cmd_inline_help(message: Message) -> None:
     message from any chat without the bot ever writing into that chat.
 
     Registered on ``start_router`` (the LAST router) on purpose: live
-    sessions and wizards own their own text catch-alls, so pressing the
-    button mid-chat still relays to the partner, exactly like every other
-    main-menu label does.
+    sessions own their own text catch-alls. Those catch-alls now refuse to relay
+    bot control labels so a menu button is never delivered to the partner as
+    chat text — the real-time session (``handlers.anon_chat``) passes this one
+    through with SkipHandler so it opens here, while the inbox session
+    (``handlers.anonymous``) answers with a "close the chat first" warning.
     """
     # A group gets nothing: this card only makes sense in the private chat
     # where the inline query is actually typed. Checked before ``me()`` so the

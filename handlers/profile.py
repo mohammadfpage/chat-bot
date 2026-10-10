@@ -27,10 +27,12 @@ from keyboards import (
     blocked_list_kb,
     wallet_kb,
     wallet_history_kb,
+    profile_card_kb,
+    profile_edit_kb,
     GENDER_FEMALE_LABEL,
     GENDER_MALE_LABEL,
 )
-from states import ProfileSetup, ChatState
+from states import ProfileSetup, ProfileEdit, ChatState
 from utils.economy import (
     wallet_info,
     claim_daily_bonus,
@@ -62,6 +64,59 @@ router.message.filter(F.chat.type == ChatType.PRIVATE)
 
 
 # ──────────────────────────────────────────────────
+# Profile card rendering (shared by the menu and every edit)
+# ──────────────────────────────────────────────────
+
+async def _profile_photo_file_id(user, bot) -> str | None:
+    """The file id to show on the card, or ``None`` for a text-only card.
+
+    Keeps the rule the card has always used: the user must have opted in
+    (``show_profile_photo``); a custom upload wins, otherwise the freshest
+    Telegram profile photo is fetched live. The fetch is a Bot API call, so it
+    must never run inside an open DB session — both callers pass a user that is
+    already detached.
+    """
+    if not user.show_profile_photo:
+        return None
+    if user.profile_photo:
+        return user.profile_photo
+    photos = await bot.get_user_profile_photos(user.telegram_id, limit=1)
+    if photos and photos.total_count > 0:
+        return photos.photos[0][-1].file_id
+    return None
+
+
+async def _send_profile_card(target: Message, user) -> None:
+    """Send the profile card with the «✏️ ویرایش پروفایل» button under it.
+
+    Sent as a NEW message rather than edited in place: the card may carry a
+    photo, and Telegram refuses to turn a photo message back into text. The
+    edit button is inline so it sits directly beneath the card while the
+    persistent reply menu stays on screen at the same time.
+    """
+    caption = format_user_profile(
+        telegram_id=user.telegram_id,
+        first_name=user.first_name,
+        username=user.username,
+        age=user.age,
+        city=user.city,
+        height=user.height,
+    )
+    photo_file_id = await _profile_photo_file_id(user, target.bot)
+    if photo_file_id:
+        await target.answer_photo(
+            photo=photo_file_id,
+            caption=caption,
+            parse_mode="HTML",
+            reply_markup=profile_card_kb(),
+        )
+    else:
+        await target.answer(
+            caption, parse_mode="HTML", reply_markup=profile_card_kb()
+        )
+
+
+# ──────────────────────────────────────────────────
 # Show profile or trigger setup
 # ──────────────────────────────────────────────────
 
@@ -82,47 +137,16 @@ async def show_profile(message: Message, state: FSMContext) -> None:
         await _start_setup(message, state)
         return
 
-    # ── Build profile card ──
-    caption = format_user_profile(
-        telegram_id=user.telegram_id,
-        first_name=user.first_name,
-        username=user.username,
-        age=user.age,
-        city=user.city,
-        height=user.height,
-    )
-
-    # ── Profile photo: only if the user chose to show it ──
-    photo_file_id: str | None = None
-    if user.show_profile_photo:
-        if user.profile_photo:
-            photo_file_id = user.profile_photo
-        else:
-            photos = await message.bot.get_user_profile_photos(
-                message.from_user.id, limit=1
-            )
-            if photos and photos.total_count > 0:
-                photo_file_id = photos.photos[0][-1].file_id
+    await _send_profile_card(message, user)
 
     # A profile completed before gender existed cannot be matched by «چت با
-    # دختر» / «چت با پسر». Offer the missing answer here rather than leaving the
-    # user to discover it as a silent failure at the matching button.
-    keyboard = (
-        set_gender_kb()
-        if user.gender is None
-        else main_menu_kb()
-    )
-
-    if photo_file_id:
-        await message.answer_photo(
-            photo=photo_file_id,
-            caption=caption,
-            parse_mode="HTML",
-            reply_markup=keyboard,
-        )
-    else:
+    # دختر» / «چت با پسر». The edit menu can set it, but this one-tap offer is
+    # kept on the card so the fix stays visible without hunting for it.
+    if user.gender is None:
         await message.answer(
-            caption, parse_mode="HTML", reply_markup=keyboard
+            "🚻 برای فعال‌شدن «چت با دختر» / «چت با پسر» جنسیت خود را "
+            "انتخاب کنید:",
+            reply_markup=set_gender_kb(),
         )
 
 
@@ -136,7 +160,9 @@ async def show_profile(message: Message, state: FSMContext) -> None:
     # «ذخیره شد.» reply, never reaches the height step or the confirmation —
     # and ``is_profile_complete`` is never set, so the profile silently never
     # completes. Excluding the whole group lets ``process_gender`` handle it.
-    ~StateFilter(ProfileSetup),
+    # ``ProfileEdit`` is excluded for the same reason: its gender step must be
+    # answered by ``edit_gender`` (which re-draws the card), not swallowed here.
+    ~StateFilter(ProfileSetup, ProfileEdit),
 )
 async def set_gender_standalone(message: Message, state: FSMContext) -> None:
     """Answer the standalone «set your gender» prompt on an existing profile.
@@ -505,6 +531,261 @@ async def cancel_confirm(message: Message, state: FSMContext) -> None:
     """Cancel profile setup at the confirmation step."""
     await state.clear()
     await message.answer("❌ تکمیل پروفایل لغو شد.", reply_markup=main_menu_kb())
+
+
+# ──────────────────────────────────────────────────
+# Profile Edit  («✏️ ویرایش پروفایل» — one field at a time)
+# ──────────────────────────────────────────────────
+
+async def _finish_field_edit(message: Message, state: FSMContext, **values) -> None:
+    """Persist the edited field(s), restore the menu and re-draw the card.
+
+    The DB write happens inside the ``async with`` block; every Telegram call
+    (the "saved" note, the re-rendered card) happens after it closes — the same
+    no-network-under-a-session rule the rest of this file follows. The returned
+    ``user`` stays usable after the session closes because the factory is built
+    with ``expire_on_commit=False``.
+    """
+    user = None
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(User).where(User.telegram_id == message.from_user.id)
+        )
+        user = result.scalar_one_or_none()
+        if user is not None:
+            for field, value in values.items():
+                setattr(user, field, value)
+            await session.commit()
+
+    await state.set_state(ChatState.idle)
+    await message.answer("✅ تغییرات ذخیره شد.", reply_markup=main_menu_kb())
+
+    if user is not None:
+        await _send_profile_card(message, user)
+
+
+async def _cancel_field_edit(message: Message, state: FSMContext) -> None:
+    """«❌ انصراف» on any edit prompt: leave the edit, restore the menu."""
+    await state.set_state(ChatState.idle)
+    await message.answer("❌ ویرایش لغو شد.", reply_markup=main_menu_kb())
+
+
+@router.callback_query(F.data == "profile:edit")
+async def cb_profile_edit(callback: CallbackQuery) -> None:
+    """Open the field picker under the profile card."""
+    text = "⚙️ <b>ویرایش پروفایل</b>\n\nکدام بخش را می‌خواهید تغییر دهید؟"
+    try:
+        await callback.message.edit_text(
+            text, parse_mode="HTML", reply_markup=profile_edit_kb()
+        )
+    except Exception:
+        # A photo card cannot be edited into text — send the picker instead.
+        await callback.message.answer(
+            text, parse_mode="HTML", reply_markup=profile_edit_kb()
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "profile:edit:back")
+async def cb_profile_edit_back(callback: CallbackQuery) -> None:
+    """Re-draw the profile card — the picker's back button."""
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(User).where(User.telegram_id == callback.from_user.id)
+        )
+        user = result.scalar_one_or_none()
+
+    await callback.answer()
+    if user is not None:
+        await _send_profile_card(callback.message, user)
+
+
+@router.callback_query(F.data == "profile:edit:age")
+async def cb_edit_age(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(ProfileEdit.waiting_for_age)
+    await callback.message.answer(
+        "🎂 <b>ویرایش سن</b>\n\nسن جدید خود را انتخاب یا تایپ کنید:",
+        parse_mode="HTML",
+        reply_markup=age_kb(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "profile:edit:city")
+async def cb_edit_city(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(ProfileEdit.waiting_for_city)
+    await callback.message.answer(
+        "🏙 <b>ویرایش شهر</b>\n\nشهر خود را انتخاب یا تایپ کنید:",
+        parse_mode="HTML",
+        reply_markup=city_kb(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "profile:edit:gender")
+async def cb_edit_gender(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(ProfileEdit.waiting_for_gender)
+    await callback.message.answer(
+        "🚻 <b>ویرایش جنسیت</b>\n\nجنسیت خود را انتخاب کنید:",
+        parse_mode="HTML",
+        reply_markup=gender_kb(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "profile:edit:height")
+async def cb_edit_height(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(ProfileEdit.waiting_for_height)
+    await callback.message.answer(
+        "📏 <b>ویرایش قد</b>\n\nقد خود را انتخاب یا تایپ کنید:",
+        parse_mode="HTML",
+        reply_markup=height_kb(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "profile:edit:photo")
+async def cb_edit_photo(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(ProfileEdit.waiting_for_photo)
+    await callback.message.answer(
+        "🖼 <b>ویرایش عکس پروفایل</b>\n\n"
+        "آیا مایلید عکس پروفایل شما نمایش داده شود؟",
+        parse_mode="HTML",
+        reply_markup=profile_photo_choice_kb(),
+    )
+    await callback.answer()
+
+
+# ── one message handler per editable field ──
+
+@router.message(ProfileEdit.waiting_for_age)
+async def edit_age(message: Message, state: FSMContext) -> None:
+    if message.text == "❌ انصراف":
+        await _cancel_field_edit(message, state)
+        return
+
+    if (
+        not message.text
+        or not message.text.isdigit()
+        or not (16 <= int(message.text) <= 50)
+    ):
+        await message.answer("⚠️ لطفاً یک عدد بین ۱۶ تا ۵۰ وارد کنید.")
+        return
+
+    await _finish_field_edit(message, state, age=int(message.text))
+
+
+@router.message(ProfileEdit.waiting_for_city)
+async def edit_city(message: Message, state: FSMContext) -> None:
+    if message.text == "❌ انصراف":
+        await _cancel_field_edit(message, state)
+        return
+
+    city = message.text
+    if city == "✏️ شهر دیگر":
+        await message.answer("📝 نام شهر خود را تایپ کنید:")
+        return
+
+    if not city or len(city) < 2:
+        await message.answer("⚠️ لطفاً نام شهر معتبر وارد کنید.")
+        return
+    # See ``process_city``: past the column width (String(128)) PostgreSQL
+    # rejects the row at commit, so the length is guarded before the write.
+    if len(city) > 128:
+        await message.answer("⚠️ نام شهر خیلی بلند است؛ حداکثر ۱۲۸ کاراکتر.")
+        return
+
+    await _finish_field_edit(message, state, city=city)
+
+
+@router.message(ProfileEdit.waiting_for_gender)
+async def edit_gender(message: Message, state: FSMContext) -> None:
+    if message.text == "❌ انصراف":
+        await _cancel_field_edit(message, state)
+        return
+
+    gender = GENDER_BY_LABEL.get((message.text or "").strip())
+    if gender is None:
+        await message.answer(
+            "لطفاً یکی از گزینه‌ها را انتخاب کنید.", reply_markup=gender_kb()
+        )
+        return
+
+    await _finish_field_edit(message, state, gender=gender)
+
+
+@router.message(ProfileEdit.waiting_for_height)
+async def edit_height(message: Message, state: FSMContext) -> None:
+    if message.text == "❌ انصراف":
+        await _cancel_field_edit(message, state)
+        return
+
+    if not message.text:
+        await message.answer("⚠️ لطفاً قد خود را وارد کنید.")
+        return
+    # String(32) column — same DataError story as the city field.
+    if len(message.text) > 32:
+        await message.answer("⚠️ قد خیلی بلند است؛ حداکثر ۳۲ کاراکتر وارد کنید.")
+        return
+
+    await _finish_field_edit(message, state, height=message.text)
+
+
+@router.message(ProfileEdit.waiting_for_photo, F.text == "🖼 آخرین عکس پروفایل تلگرام")
+async def edit_photo_last_telegram(message: Message, state: FSMContext) -> None:
+    photos = await message.bot.get_user_profile_photos(message.from_user.id, limit=1)
+    if not photos or photos.total_count == 0:
+        await message.answer(
+            "⚠️ شما عکس پروفایلی در تلگرام ندارید.\n"
+            "می‌توانید «📷 ارسال عکس دلخواه» را بزنید "
+            "یا «🙈 بدون عکس» را انتخاب کنید."
+        )
+        return
+
+    # ``profile_photo=None`` means "always use the latest Telegram photo".
+    await _finish_field_edit(
+        message, state, show_profile_photo=True, profile_photo=None
+    )
+
+
+@router.message(ProfileEdit.waiting_for_photo, F.text == "📷 ارسال عکس دلخواه")
+async def edit_photo_custom(message: Message, state: FSMContext) -> None:
+    await message.answer(
+        "📷 <b>عکس دلخواه خود را بفرستید:</b>",
+        parse_mode="HTML",
+        reply_markup=photo_upload_kb(),
+    )
+
+
+@router.message(ProfileEdit.waiting_for_photo, F.text == "🙈 بدون عکس")
+async def edit_photo_none(message: Message, state: FSMContext) -> None:
+    await _finish_field_edit(
+        message, state, show_profile_photo=False, profile_photo=None
+    )
+
+
+@router.message(ProfileEdit.waiting_for_photo, F.text == "❌ انصراف")
+async def edit_photo_cancel(message: Message, state: FSMContext) -> None:
+    await _cancel_field_edit(message, state)
+
+
+@router.message(ProfileEdit.waiting_for_photo, F.photo)
+async def edit_photo_upload(message: Message, state: FSMContext) -> None:
+    await _finish_field_edit(
+        message,
+        state,
+        show_profile_photo=True,
+        profile_photo=message.photo[-1].file_id,
+    )
+
+
+@router.message(ProfileEdit.waiting_for_photo)
+async def edit_photo_invalid(message: Message, state: FSMContext) -> None:
+    """Any other text on the photo step → re-show the choices, stay in state."""
+    await message.answer(
+        "⚠️ لطفاً یک عکس بفرستید یا یکی از گزینه‌ها را انتخاب کنید.",
+        reply_markup=profile_photo_choice_kb(),
+    )
 
 
 # ──────────────────────────────────────────────────

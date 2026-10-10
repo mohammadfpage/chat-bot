@@ -153,6 +153,65 @@ class UserReport(Base):
         return f"<UserReport {self.reporter_id} -> {self.reported_id}>"
 
 
+class SupportTicket(Base):
+    """A two-way «🎧 پشتیبانی» conversation between one user and the team.
+
+    Unlike :class:`UserReport` (a one-shot block event), a ticket is
+    ANSWERABLE: messages travel both ways and the panel can tell at a glance
+    which tickets still need a reply.
+
+    ``status`` is the whole routing contract:
+
+        ``open``      the user wrote last — waiting for an admin answer
+        ``answered``  the team replied; the user may still follow up
+        ``closed``    resolved and filed away; a new message opens a NEW ticket
+
+    ``updated_at`` moves on every message, so the panel list can sort by
+    "most recently touched" instead of creation order.
+    """
+
+    __tablename__ = "support_tickets"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="open", index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now(), index=True
+    )
+
+    def __repr__(self) -> str:
+        return f"<SupportTicket {self.id} user={self.user_id} status={self.status}>"
+
+
+class SupportMessage(Base):
+    """One message inside a :class:`SupportTicket` (user- or admin-authored)."""
+
+    __tablename__ = "support_messages"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    ticket_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    sender_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
+    content: Mapped[str] = mapped_column(String(4096), nullable=False)
+    #: False until the recipient opens the ticket; the panel shows unread user
+    #: messages in bold so an admin can see what still needs attention.
+    is_read: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), index=True
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<SupportMessage {self.id} ticket={self.ticket_id} "
+            f"admin={self.is_admin}>"
+        )
+
+
 class AnonymousContact(Base):
     """Bidirectional anonymous contact record created via deep links.
 

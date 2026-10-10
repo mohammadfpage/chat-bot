@@ -57,12 +57,14 @@ def admin_panel_kb(*, is_root: bool = False) -> InlineKeyboardMarkup:
         [🪙 هزینهٔ سرویس‌ها]  [🏆 پاداش‌ها]        economy — what things COST
         [🛡️ ضداسپم]           [🔒 تنظیمات نجوا]    rules & features
         [📢 عضویت اجباری]     [📈 گزارش سکه]       entry gate + reports
+        [🎧 تیکت‌های پشتیبانی]                      support inbox
         ([💾 پشتیبان‌گیری] [👑 ادمین‌ها])          root only
 
     Two per row keeps every label inside Telegram's truncation width, and the
     last ``.adjust`` value repeats for the final row — so the keyboard re-flows
-    to 10 buttons (no root) or 11 (root) without the layout being written
-    twice.
+    to 11 buttons (no root) or 13 (root) without the layout being written
+    twice. Support sits alone on its row: it is an inbox that needs a reply
+    count, not a setting that pairs with a neighbour.
 
     Args:
         is_root: ``True`` when the viewer is a Root (Super) Admin.
@@ -140,6 +142,16 @@ def admin_panel_kb(*, is_root: bool = False) -> InlineKeyboardMarkup:
         style="primary",
         icon_custom_emoji_id=get_premium_id("chart"),
     )
+
+    # ── Support inbox ──
+    # Its own row on purpose: the ticket list is where an unanswered user is
+    # answered, so it must be findable without pairing it to a setting.
+    builder.button(
+        text=f"{get_plain_emoji('support')} تیکت‌های پشتیبانی",
+        callback_data="admin:support",
+        style="success",
+        icon_custom_emoji_id=get_premium_id("support"),
+    )
     if is_root:
         builder.button(
             text=f"{get_plain_emoji('database')} پشتیبان‌گیری",
@@ -153,7 +165,7 @@ def admin_panel_kb(*, is_root: bool = False) -> InlineKeyboardMarkup:
             style="danger",
             icon_custom_emoji_id=get_premium_id("crown"),
         )
-    builder.adjust(2, 2, 2, 2, 2)
+    builder.adjust(2, 2, 2, 2, 2, 1, 2)
     return builder.as_markup()
 
 
@@ -772,6 +784,134 @@ def admin_forcejoin_channels_kb(channels, not_admin_ids=None) -> InlineKeyboardM
     return builder.as_markup()
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Support ticket inbox
+# ──────────────────────────────────────────────────────────────────────────
+def admin_support_kb(
+    *, open_count: int, answered_count: int, total: int
+) -> InlineKeyboardMarkup:
+    """Support inbox filter row + the way back to the panel.
+
+    The two counts are shown on the buttons because the question this screen
+    answers is «how many still need me?» — and «باز» (open) is green, the
+    colour of the action that must be taken, while answered tickets are a
+    calmer blue.
+    """
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text=f"{get_plain_emoji('pending')} در انتظار پاسخ ({open_count})",
+        callback_data="admin:support:list:open:1",
+        style="success",
+    )
+    builder.button(
+        text=f"{get_plain_emoji('check')} پاسخ‌داده‌شده ({answered_count})",
+        callback_data="admin:support:list:answered:1",
+        style="primary",
+    )
+    builder.button(
+        text=f"{get_plain_emoji('list')} همه ({total})",
+        callback_data="admin:support:list:all:1",
+        style="primary",
+    )
+    _back_button(builder)
+    builder.adjust(1, 1, 1, 1)
+    return builder.as_markup()
+
+
+def admin_support_list_kb(
+    rows: list[tuple[int, str]],
+    *,
+    status: str,
+    page: int,
+    has_next: bool,
+) -> InlineKeyboardMarkup:
+    """One row per ticket button, then the pager, then «بازگشت».
+
+    ``rows`` is ``[(ticket_id, label), …]`` prepared by the handler; the label
+    already carries the status badge and the unread marker, so this function
+    stays free of formatting decisions.
+    """
+    builder = InlineKeyboardBuilder()
+    for ticket_id, label in rows:
+        builder.row(
+            InlineKeyboardButton(
+                text=label,
+                callback_data=f"admin:support:open:{ticket_id}",
+                style="primary",
+            )
+        )
+
+    nav: list[InlineKeyboardButton] = []
+    if page > 1:
+        nav.append(
+            _button("قبلی", f"admin:support:list:{status}:{page - 1}", "prev")
+        )
+    if has_next:
+        nav.append(
+            _button("بعدی", f"admin:support:list:{status}:{page + 1}", "next")
+        )
+    if nav:
+        builder.row(*nav)
+    builder.row(_button("بازگشت به پشتیبانی", "admin:support", "back"))
+    return builder.as_markup()
+
+
+def admin_support_ticket_kb(ticket_id: int, *, closed: bool) -> InlineKeyboardMarkup:
+    """Actions under one ticket transcript.
+
+    «✍️ پاسخ دادن» always comes first — it is the reason the admin opened this
+    screen. A closed ticket offers «بازکردن مجدد» instead of «بستن».
+    """
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        _button(
+            "پاسخ دادن",
+            f"admin:support:reply:{ticket_id}",
+            "reply",
+            style="success",
+        )
+    )
+    if closed:
+        builder.row(
+            _button(
+                "بازکردن مجدد",
+                f"admin:support:reopen:{ticket_id}",
+                "refresh",
+                style="primary",
+            )
+        )
+    else:
+        builder.row(
+            _button(
+                "بستن تیکت",
+                f"admin:support:close:{ticket_id}",
+                "check",
+                style="primary",
+            )
+        )
+    builder.row(_button("بازگشت به لیست", "admin:support", "back"))
+    return builder.as_markup()
+
+
+def admin_support_notify_kb(ticket_id: int) -> InlineKeyboardMarkup:
+    """The DM button pushed to every admin when a user writes in.
+
+    Its callback is the *same* ``admin:support:open:`` the panel list uses, so
+    the notification opens the very same transcript view — no second code path
+    to keep in sync.
+    """
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        _button(
+            "مشاهده و پاسخ",
+            f"admin:support:open:{ticket_id}",
+            "reply",
+            style="success",
+        )
+    )
+    return builder.as_markup()
+
+
 __all__ = [
     "BACK_TO_PANEL",
     "admin_panel_kb",
@@ -801,4 +941,8 @@ __all__ = [
     "admin_whisper_kb",
     "admin_forcejoin_kb",
     "admin_forcejoin_channels_kb",
+    "admin_support_kb",
+    "admin_support_list_kb",
+    "admin_support_ticket_kb",
+    "admin_support_notify_kb",
 ]

@@ -2,6 +2,8 @@
     ANON_SESSION_END_LABEL,
     BACK_TO_MENU,
     BACK_TO_MENU_TEXTS,
+    BOT_CONTROL_TEXTS,
+    is_bot_control_text,
     INLINE_HELP_LABEL,
     NEXT_CHAT_LABEL,
     RANDOM_CONNECT_LABEL,
@@ -10,6 +12,7 @@
     GENDER_MALE_LABEL,
     GENDER_FEMALE_LABEL,
     REMATCH_LABEL,
+    SUPPORT_LABEL,
     main_menu_kb,
     queue_menu_kb,
     chat_menu_kb,
@@ -84,6 +87,10 @@ from keyboards.admin import (
     admin_whisper_kb,
     admin_forcejoin_kb,
     admin_forcejoin_channels_kb,
+    admin_support_kb,
+    admin_support_list_kb,
+    admin_support_ticket_kb,
+    admin_support_notify_kb,
 )
 from keyboards.user import (
     main_menu_inline_kb,
@@ -92,6 +99,11 @@ from keyboards.user import (
     wallet_kb,
     wallet_history_kb,
     rematch_offer_kb,
+    profile_card_kb,
+    profile_edit_kb,
+    support_menu_kb,
+    support_history_kb,
+    support_ticket_kb,
 )
 
 __all__ = [
@@ -99,6 +111,8 @@ __all__ = [
     "ANON_SESSION_END_LABEL",
     "BACK_TO_MENU",
     "BACK_TO_MENU_TEXTS",
+    "BOT_CONTROL_TEXTS",
+    "is_bot_control_text",
     "INLINE_HELP_LABEL",
     "NEXT_CHAT_LABEL",
     "RANDOM_CONNECT_LABEL",
@@ -107,6 +121,7 @@ __all__ = [
     "GENDER_MALE_LABEL",
     "GENDER_FEMALE_LABEL",
     "REMATCH_LABEL",
+    "SUPPORT_LABEL",
     "main_menu_kb",
     "queue_menu_kb",
     "chat_menu_kb",
@@ -179,6 +194,10 @@ __all__ = [
     "admin_whisper_kb",
     "admin_forcejoin_kb",
     "admin_forcejoin_channels_kb",
+    "admin_support_kb",
+    "admin_support_list_kb",
+    "admin_support_ticket_kb",
+    "admin_support_notify_kb",
     # user inline
     "main_menu_inline_kb",
     "welcome_group_kb",
@@ -186,4 +205,9 @@ __all__ = [
     "wallet_kb",
     "wallet_history_kb",
     "rematch_offer_kb",
+    "profile_card_kb",
+    "profile_edit_kb",
+    "support_menu_kb",
+    "support_history_kb",
+    "support_ticket_kb",
 ]

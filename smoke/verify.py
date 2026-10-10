@@ -26,6 +26,8 @@ if hasattr(sys.stdout, "reconfigure"):
 
 SMOKES = [
     "smoke_handlers5.py",
+    "smoke_support.py",
+    "smoke_profile_edit.py",
     "smoke_forcejoin.py",
     "smoke_phase2.py",
     "smoke_economy.py",

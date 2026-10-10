@@ -77,6 +77,7 @@ PRIVATE_COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec("start", "منوی ربات"),
     CommandSpec("menu", "منوی اصلی"),
     CommandSpec("help", "راهنما"),
+    CommandSpec("support", "پشتیبانی"),
     CommandSpec("w", "نجوا در گروه", whisper=True),
     CommandSpec("inline", "نجوا اینلاین", whisper=True),
 )
@@ -201,6 +202,7 @@ def private_commands_text(
         "<code>/start</code> — منوی ربات",
         "<code>/menu</code> — منوی اصلی",
         "<code>/help</code> — همین راهنما",
+        "<code>/support</code> — ارتباط با پشتیبانی",
     ]
 
     if whisper:

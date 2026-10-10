@@ -9,6 +9,7 @@ from handlers.anonymous import router as anonymous_router
 from handlers.whisper import router as whisper_router
 from handlers.inline_anon import router as inline_anon_router
 from handlers.anon_chat import router as anon_chat_router
+from handlers.support import router as support_router
 
 __all__ = [
     "navigation_router",
@@ -22,4 +23,5 @@ __all__ = [
     "whisper_router",
     "inline_anon_router",
     "anon_chat_router",
+    "support_router",
 ]

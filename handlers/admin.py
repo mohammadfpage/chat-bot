@@ -30,6 +30,8 @@ from database import (
     BotPolicy,
     CoinTransaction,
     RequiredChannel,
+    SupportMessage,
+    SupportTicket,
     User,
     UserReport,
     Whisper,
@@ -57,17 +59,22 @@ from keyboards.admin import (
     admin_whisper_kb,
     admin_forcejoin_kb,
     admin_forcejoin_channels_kb,
+    admin_support_kb,
+    admin_support_list_kb,
+    admin_support_ticket_kb,
     policy_field_from_suffix,
     policy_field_label,
     policy_field_emoji,
     policy_section_of,
 )
+from handlers.support import deliver_team_reply
 from states import (
     AdminBroadcast,
     AdminPIS,
     AdminGift,
     AdminPolicyEdit,
     AdminReport,
+    AdminSupport,
     AdminWhisper,
 )
 from utils.economy import (
@@ -85,6 +92,13 @@ from utils.economy import (
 )
 from utils.emojis import get_plain_emoji
 from utils.group_admin import bot_is_admin
+from utils.support import (
+    STATUS_ANSWERED,
+    STATUS_CLOSED,
+    STATUS_OPEN,
+    status_from_filter,
+    status_label,
+)
 from utils.membership import clear_membership_cache, resolve_chat_ref
 from utils.whisper_config import get_whisper_config, refresh_whisper_config
 
@@ -647,6 +661,355 @@ async def cb_reports_inbox(callback: CallbackQuery) -> None:
         )
     lines.append("\nبرای گزارش کامل سکه، آیدی را در «📈 گزارش سکه» جستجو کنید.")
     await _edit_or_answer(callback, "\n".join(lines), admin_users_kb())
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 3b. Support ticket inbox  («🎧 تیکت‌های پشتیبانی»)
+# ──────────────────────────────────────────────────────────────────────────
+#: How many tickets one page of the list shows. Small enough that every button
+#: label stays readable on a phone, large enough to scan a backlog quickly.
+_SUPPORT_PAGE_SIZE = 8
+
+#: Filter token -> Persian heading for the list screen.
+_SUPPORT_FILTER_LABELS = {
+    "open": "در انتظار پاسخ",
+    "answered": "پاسخ‌داده‌شده",
+    "all": "همه",
+}
+
+
+async def _render_admin_ticket(
+    ticket_id: int, *, mark_read: bool = True
+) -> tuple[str, object, bool]:
+    """Build the admin transcript for one ticket.
+
+    Returns ``(text, keyboard, found)``. ``found`` is ``False`` when the ticket
+    no longer exists, so every caller can answer the tap uniformly instead of
+    editing a card into an error string.
+
+    Opening a ticket marks the user's messages read — that flag is what turns
+    the list's red unread badge off, so it must happen on *view*, not on close.
+    """
+    async with async_session_factory() as session:
+        ticket = (
+            await session.execute(
+                select(SupportTicket).where(SupportTicket.id == ticket_id)
+            )
+        ).scalar_one_or_none()
+        if ticket is None:
+            return "", None, False
+
+        user = (
+            await session.execute(
+                select(User).where(User.telegram_id == ticket.user_id)
+            )
+        ).scalar_one_or_none()
+        messages = (
+            await session.execute(
+                select(SupportMessage)
+                .where(SupportMessage.ticket_id == ticket_id)
+                .order_by(
+                    SupportMessage.created_at.asc(), SupportMessage.id.asc()
+                )
+                .limit(30)
+            )
+        ).scalars().all()
+
+        if mark_read and any(not m.is_admin and not m.is_read for m in messages):
+            for m in messages:
+                if not m.is_admin:
+                    m.is_read = True
+            await session.commit()
+
+    if user and user.first_name:
+        name = user.first_name
+    elif user and user.username:
+        name = f"@{user.username}"
+    else:
+        name = str(ticket.user_id)
+
+    # The ledger stores naive UTC; the panel reads Tehran time (+3:30).
+    tehran = timedelta(hours=3, minutes=30)
+    lines = [
+        f"🎧 <b>تیکت #{ticket.id}</b>",
+        f"وضعیت: {status_label(ticket.status)}",
+        f"👤 کاربر: {escape(name)} · <code>{ticket.user_id}</code>",
+        "",
+    ]
+    for m in messages:
+        when = (m.created_at + tehran).strftime("%m-%d %H:%M") if m.created_at else ""
+        who = "💬 <b>پشتیبانی:</b>" if m.is_admin else "🗣 <b>کاربر:</b>"
+        lines.append(f"{who} <code>{when}</code>")
+        lines.append(escape(m.content))
+        lines.append("")
+    if not messages:
+        lines.append("<i>این تیکت خالی است.</i>")
+
+    kb = admin_support_ticket_kb(ticket.id, closed=ticket.status == STATUS_CLOSED)
+    return "\n".join(lines).strip(), kb, True
+
+
+@router.callback_query(F.data == "admin:support")
+async def cb_support_inbox(callback: CallbackQuery) -> None:
+    """The support inbox: counts per bucket, then pick a filter."""
+    async with async_session_factory() as session:
+        open_count = await session.scalar(
+            select(func.count(SupportTicket.id)).where(
+                SupportTicket.status == STATUS_OPEN
+            )
+        ) or 0
+        answered_count = await session.scalar(
+            select(func.count(SupportTicket.id)).where(
+                SupportTicket.status == STATUS_ANSWERED
+            )
+        ) or 0
+        total = await session.scalar(select(func.count(SupportTicket.id))) or 0
+
+    await _edit_or_answer(
+        callback,
+        "🎧 <b>پشتیبانی</b>\n\n"
+        f"{get_plain_emoji('pending')} در انتظار پاسخ: <b>{open_count}</b>\n"
+        f"{get_plain_emoji('check')} پاسخ‌داده‌شده: <b>{answered_count}</b>\n"
+        f"{get_plain_emoji('ticket')} کل تیکت‌ها: <b>{total}</b>\n\n"
+        "برای دیدن فهرست، یکی از فیلترها را انتخاب کنید.",
+        admin_support_kb(
+            open_count=open_count, answered_count=answered_count, total=total
+        ),
+    )
+
+
+@router.callback_query(F.data.startswith("admin:support:list:"))
+async def cb_support_list(callback: CallbackQuery) -> None:
+    """Paginated ticket list, filtered by status."""
+    # admin:support:list:{status}:{page}
+    parts = (callback.data or "").split(":")
+    token = parts[3] if len(parts) > 3 else "open"
+    try:
+        page = max(int(parts[4]), 1)
+    except (IndexError, ValueError):
+        page = 1
+    status = status_from_filter(token)
+
+    async with async_session_factory() as session:
+        stmt = select(SupportTicket).order_by(
+            SupportTicket.updated_at.desc(), SupportTicket.id.desc()
+        )
+        if status is not None:
+            stmt = stmt.where(SupportTicket.status == status)
+        tickets = (
+            await session.execute(
+                stmt.offset((page - 1) * _SUPPORT_PAGE_SIZE).limit(
+                    _SUPPORT_PAGE_SIZE
+                )
+            )
+        ).scalars().all()
+
+        users: dict[int, User] = {}
+        unread: dict[int, int] = {}
+        if tickets:
+            ids = [t.id for t in tickets]
+            owner_ids = {t.user_id for t in tickets}
+            for u in (
+                await session.execute(
+                    select(User).where(User.telegram_id.in_(owner_ids))
+                )
+            ).scalars().all():
+                users[u.telegram_id] = u
+            rows = await session.execute(
+                select(SupportMessage.ticket_id, func.count(SupportMessage.id))
+                .where(
+                    SupportMessage.ticket_id.in_(ids),
+                    SupportMessage.is_admin.is_(False),
+                    SupportMessage.is_read.is_(False),
+                )
+                .group_by(SupportMessage.ticket_id)
+            )
+            unread = {tid: cnt for tid, cnt in rows.all()}
+
+    heading = _SUPPORT_FILTER_LABELS.get(token, "همه")
+    lines = [f"🎧 <b>تیکت‌های پشتیبانی</b> — {heading}\n"]
+    rows_out: list[tuple[int, str]] = []
+    for t in tickets:
+        u = users.get(t.user_id)
+        if u and u.first_name:
+            name = u.first_name
+        elif u and u.username:
+            name = f"@{u.username}"
+        else:
+            name = str(t.user_id)
+        badge = f" 🔴 {unread[t.id]}" if unread.get(t.id) else ""
+        lines.append(f"• {status_label(t.status)} #{t.id} · {escape(name)}{badge}")
+        label = f"{status_label(t.status)} #{t.id} · {name}{badge}"
+        if len(label) > 62:
+            label = label[:62] + "…"
+        rows_out.append((t.id, label))
+    if not tickets:
+        lines.append("<i>تیکتی با این وضعیت وجود ندارد.</i>")
+
+    await _edit_or_answer(
+        callback,
+        "\n".join(lines),
+        admin_support_list_kb(
+            rows_out,
+            status=token,
+            page=page,
+            has_next=len(tickets) == _SUPPORT_PAGE_SIZE,
+        ),
+    )
+
+
+@router.callback_query(F.data.startswith("admin:support:open:"))
+async def cb_support_open(callback: CallbackQuery) -> None:
+    """Open one ticket — also the target of the notification DM button."""
+    try:
+        ticket_id = int((callback.data or "").rsplit(":", 1)[-1])
+    except ValueError:
+        await callback.answer("تیکت نامعتبر است.", show_alert=True)
+        return
+
+    text, kb, found = await _render_admin_ticket(ticket_id)
+    if not found:
+        await callback.answer("تیکت پیدا نشد.", show_alert=True)
+        return
+    await _edit_or_answer(callback, text, kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:support:reply:"))
+async def cb_support_reply(callback: CallbackQuery, state: FSMContext) -> None:
+    """Arm the admin's next text message as the answer to this ticket."""
+    try:
+        ticket_id = int((callback.data or "").rsplit(":", 1)[-1])
+    except ValueError:
+        await callback.answer("تیکت نامعتبر است.", show_alert=True)
+        return
+
+    async with async_session_factory() as session:
+        exists = await session.scalar(
+            select(SupportTicket.id).where(SupportTicket.id == ticket_id)
+        )
+    if not exists:
+        await callback.answer("تیکت پیدا نشد.", show_alert=True)
+        return
+
+    await state.set_state(AdminSupport.waiting_for_reply)
+    await state.set_data({"ticket_id": ticket_id})
+    await _edit_or_answer(
+        callback,
+        f"✍️ <b>پاسخ به تیکت #{ticket_id}</b>\n\n"
+        "متن پاسخ را بنویسید. این متن با سلام و سپاس‌گزاری تیم برای کاربر "
+        "ارسال می‌شود.",
+        admin_cancel_kb(),
+    )
+
+
+async def _set_ticket_status(
+    callback: CallbackQuery, status: str, note: str
+) -> None:
+    """Flip a ticket's status (close / reopen) and re-render its card."""
+    try:
+        ticket_id = int((callback.data or "").rsplit(":", 1)[-1])
+    except ValueError:
+        await callback.answer("تیکت نامعتبر است.", show_alert=True)
+        return
+
+    missing = False
+    async with async_session_factory() as session:
+        ticket = (
+            await session.execute(
+                select(SupportTicket).where(SupportTicket.id == ticket_id)
+            )
+        ).scalar_one_or_none()
+        if ticket is None:
+            missing = True
+        else:
+            ticket.status = status
+            ticket.updated_at = func.now()
+            await session.commit()
+
+    # No Telegram call may run while the session is open, so the "not found"
+    # answer happens here, after the ``async with`` block has closed.
+    if missing:
+        await callback.answer("تیکت پیدا نشد.", show_alert=True)
+        return
+
+    text, kb, found = await _render_admin_ticket(ticket_id, mark_read=False)
+    await _edit_or_answer(callback, text, kb if found else None)
+    await callback.answer(note)
+
+
+@router.callback_query(F.data.startswith("admin:support:close:"))
+async def cb_support_close(callback: CallbackQuery) -> None:
+    await _set_ticket_status(callback, STATUS_CLOSED, "تیکت بسته شد.")
+
+
+@router.callback_query(F.data.startswith("admin:support:reopen:"))
+async def cb_support_reopen(callback: CallbackQuery) -> None:
+    await _set_ticket_status(callback, STATUS_OPEN, "تیکت باز گشود.")
+
+
+@router.message(AdminSupport.waiting_for_reply)
+async def admin_support_send_reply(message: Message, state: FSMContext) -> None:
+    """Deliver the admin's typed answer, then show the refreshed ticket."""
+    data = await state.get_data()
+    ticket_id = data.get("ticket_id")
+    content = (message.text or "").strip()
+
+    if not ticket_id or not content:
+        await message.answer(
+            "❌ پاسخ نامعتبر است. دوباره تلاش کنید.",
+            reply_markup=admin_cancel_kb(),
+        )
+        return
+
+    missing = False
+    async with async_session_factory() as session:
+        ticket = (
+            await session.execute(
+                select(SupportTicket).where(SupportTicket.id == ticket_id)
+            )
+        ).scalar_one_or_none()
+        if ticket is None:
+            missing = True
+        else:
+            user_id = ticket.user_id
+            session.add(
+                SupportMessage(
+                    ticket_id=ticket_id,
+                    sender_id=message.from_user.id,
+                    is_admin=True,
+                    content=content,
+                    is_read=True,
+                )
+            )
+            ticket.status = STATUS_ANSWERED
+            ticket.updated_at = func.now()
+            await session.commit()
+
+    # Telegram calls wait until the session is closed — see the session-scan
+    # smoke rule enforced across every handler.
+    if missing:
+        await state.clear()
+        await message.answer(
+            "تیکت پیدا نشد؛ بازگشت به پنل.",
+            reply_markup=admin_panel_kb(is_root=_is_root(message.from_user.id)),
+        )
+        return
+
+    await state.clear()
+    delivered = await deliver_team_reply(message.bot, user_id, content)
+    note = (
+        "✅ پاسخ برای کاربر ارسال شد."
+        if delivered
+        else "⚠️ پاسخ ثبت شد، ولی ارسال به کاربر ممکن نبود."
+    )
+
+    text, kb, found = await _render_admin_ticket(ticket_id)
+    await message.answer(
+        f"{note}\n\n{text}" if found else note,
+        parse_mode="HTML",
+        reply_markup=kb if found else admin_panel_kb(is_root=_is_root(message.from_user.id)),
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────
