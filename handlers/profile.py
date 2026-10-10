@@ -126,12 +126,24 @@ async def show_profile(message: Message, state: FSMContext) -> None:
         )
 
 
-@router.message(F.text.in_({GENDER_MALE_LABEL, GENDER_FEMALE_LABEL}))
+@router.message(
+    F.text.in_({GENDER_MALE_LABEL, GENDER_FEMALE_LABEL}),
+    # CRITICAL: this handler is registered BEFORE the wizard's ``process_gender``
+    # and has no state gate of its own, so without this exclusion it SWALLOWS
+    # the «👩 زن» / «👨 مرد» answer during ``ProfileSetup.waiting_for_gender``
+    # (both decorators match the same text; aiogram runs them in registration
+    # order). The wizard then jumps straight to ``ChatState.idle`` with a
+    # «ذخیره شد.» reply, never reaches the height step or the confirmation —
+    # and ``is_profile_complete`` is never set, so the profile silently never
+    # completes. Excluding the whole group lets ``process_gender`` handle it.
+    ~StateFilter(ProfileSetup),
+)
 async def set_gender_standalone(message: Message, state: FSMContext) -> None:
     """Answer the standalone «set your gender» prompt on an existing profile.
 
     Separate from :func:`process_gender` because this one must write straight to
-    the database and return to the menu — there is no wizard to continue.
+    the database and return to the menu — there is no wizard to continue. Only
+    reachable OUTSIDE the setup wizard (see the ``~StateFilter`` above).
     """
     gender = GENDER_BY_LABEL.get((message.text or "").strip())
     if gender is None:
