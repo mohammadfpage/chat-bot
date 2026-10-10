@@ -162,8 +162,15 @@ httpx و... در پکیج‌های Pyodide هستند)، ولی برای این 
 > فایل‌های Cloudflare Containers (`Dockerfile`، `wrangler.jsonc`،
 > `worker/index.js`، `package.json`) برای مهاجرتِ آینده در
 > `deploy/cloudflare/` نگه داشته شده‌اند — جزئیات در همان پوشه و بخش ۴
-> فایل `README.md`. بقیهٔ این بخش همان تحلیل قبلی است که چرا SQLite به درد
-> Container نمی‌خورد.
+> فایل `README.md`. از همان ریشهٔ ریپو هم قابل اجراست:
+> `npx wrangler deploy -c deploy/cloudflare/wrangler.jsonc`
+> (`wrangler.jsonc` با `image_build_context: "../.."` از ریشهٔ ریپو بیلد می‌کند).
+>
+> ⚠️ **پلن رایگان کافی نیست:** طبق صفحهٔ قیمت‌گذاری Cloudflare (اوت ۲۰۲۶)،
+> Containers فقط روی **Workers Paid (‏$5/ماه)** فعال است (`Free: N/A`). برای
+> استقرار رایگان از مسیر Render یا «سرور + تونل» (گزینهٔ ۳ همین بخش) استفاده
+> کنید. بقیهٔ این بخش همان تحلیل قبلی است که چرا SQLite به درد Container
+> نمی‌خورد.
 
 Containers (public beta) یک image داکر کاملِ پایتونی را روی شبکهٔ Cloudflare
 اجرا می‌کند؛ یعنی همین کد، بدون تغییر، با همهٔ لوپ‌های پس‌زمینه. مانع

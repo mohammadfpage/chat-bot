@@ -3,9 +3,14 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "deploy": "wrangler deploy",
-    "dev": "wrangler dev",
-    "tail": "wrangler tail"
+    "deploy": "wrangler deploy -c wrangler.jsonc",
+    "dev": "wrangler dev -c wrangler.jsonc",
+    "tail": "wrangler tail -c wrangler.jsonc",
+    "cf:dev": "wrangler dev -c wrangler.jsonc",
+    "cf:deploy": "wrangler deploy -c wrangler.jsonc",
+    "cf:tail": "wrangler tail -c wrangler.jsonc",
+    "cf:secret": "wrangler secret put -c wrangler.jsonc",
+    "cf:check": "wrangler deploy --dry-run --containers-rollout=none -c wrangler.jsonc"
   },
   "dependencies": {
     "@cloudflare/containers": "^0.3.7"

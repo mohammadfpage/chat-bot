@@ -1,7 +1,13 @@
 # Secrets — never inside the image; the Worker forwards env vars instead.
+# NOTE: this file only applies to the LEGACY in-place build (context = this
+# directory). With `image_build_context: "../.."` the context is the repo
+# root, so Docker reads the ROOT `.dockerignore` instead.
 .env
 .env.*
 !.env.example
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
 *.bak
 
 # Local state: databases, WAL siblings, backups, logs

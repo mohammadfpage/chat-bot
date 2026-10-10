@@ -132,13 +132,70 @@ Render فقط `requirements.txt` را نصب می‌کند و خودِ `bot.py` 
 به‌اشتباه به‌عنوان پروژهٔ Node/Worker شناسایی نکند و `npx wrangler deploy`
 اجرا نشود.
 
-⚠️ **هیچ‌کدام از این فایل‌ها نباید به ریشهٔ ریپو برگردند تا وقتی واقعاً
-می‌خواهید به Cloudflare مهاجرت کنید** — وجود `package.json` یا
-`wrangler.jsonc` در ریشه همان چیزی است که باعث اجرای `npx wrangler deploy`
-می‌شود. دستورات و توضیحِ بازگردانی در
-[`deploy/cloudflare/README.md`](deploy/cloudflare/README.md) است.
+⚠️ **هیچ‌کدام از این فایل‌ها نباید به ریشهٔ ریپو برگردند** — وجود
+`package.json` یا `wrangler.jsonc` در ریشه همان چیزی است که باعث اجرای
+ناخواستهٔ `npx wrangler deploy` می‌شود. با این حال، **از همان ریشهٔ ریپو
+هم می‌توان مستقیماً اجرا/استقرار کرد**؛ کافی است مسیر کانفیگ را با `-c`
+بدهید (همهٔ مسیرهای نسبی داخلی نسبت به همان فایل حل می‌شوند، نه cwd):
 
-خلاصهٔ معماری قدیمی: کانتینر `python:3.12` کل ربات را اجرا می‌کند (بدون VPS)،
+```powershell
+# یک‌بار: نصب ابزار Node در همان پوشه (نه در ریشه)
+npm install --prefix deploy/cloudflare
+
+# a) دو حالت معادل برای همهٔ دستورات:
+npx wrangler dev    -c deploy/cloudflare/wrangler.jsonc   # لوکال (نیاز به Docker)
+npx wrangler deploy -c deploy/cloudflare/wrangler.jsonc   # استقرار
+npx wrangler tail   -c deploy/cloudflare/wrangler.jsonc   # لاگ زنده
+npx wrangler secret put BOT_TOKEN -c deploy/cloudflare/wrangler.jsonc
+
+# b) یا اسکریپت‌های آمادهٔ npm (بدون نیاز به -c؛ cwd خودش همان پوشه است):
+npm --prefix deploy/cloudflare run cf:dev
+npm --prefix deploy/cloudflare run cf:deploy
+npm --prefix deploy/cloudflare run cf:tail
+npm --prefix deploy/cloudflare run cf:secret -- BOT_TOKEN
+npm --prefix deploy/cloudflare run cf:check   # اعتبارسنجی offline (dry-run)
+```
+
+`wrangler.jsonc` در بخش `containers` مقدار `"image_build_context": "../.."`
+دارد؛ یعنی Docker با **context = ریشهٔ ریپو** ساخته می‌شود و `Dockerfile`
+به `requirements.txt` و سورس ربات دسترسی دارد — دیگر نیازی به کپی‌کردن فایل‌ها
+به ریشه نیست. `.dockerignore` ریشه جلوی ورود `.env`/`venv`/`*.db`/`node_modules`
+به image را می‌گیرد.
+
+### متغیرها و secret ها
+
+| کلید | محل |
+| --- | --- |
+| `RUN_MODE`, `WEBHOOK_PATH`, `WEBAPP_*`, `ADMIN_IDS`, `LOG_*` | `wrangler.jsonc` → `vars` (غیرحساس) |
+| `BOT_TOKEN`, `DATABASE_URL`, `WEBHOOK_SECRET`, `REDIS_URL`, `PROXY_URL` | `npx wrangler secret put <KEY>` (هرگز در git) |
+
+برای `wrangler dev` لوکال، همان کلیدها از فایل **`deploy/cloudflare/.dev.vars`**
+خوانده می‌شوند (git-ignored؛ الگو: `.dev.vars.example`). `DATABASE_URL` لوکال
+می‌تواند SQLite باشد، ولی **در container واقعی دیسک موقتی است** و ربات با
+`sqlite` عمداً بالا نمی‌آید؛ پس `DATABASE_URL` استقرار باید PostgreSQL باشد.
+
+### ثبت وبهوک و رهاسازی
+
+بعد از اولین deploy، آدرس `https://<worker>.workers.dev` را گرفته و با
+کمک‌اسکریپت داخل ریپو ثبت کنید (خودش `allowed_updates` را از dispatcher
+می‌سازد تا `chat_member` جا نیفتد):
+
+```powershell
+python deploy/cloudflare/set_webhook.py --url https://<worker>.workers.dev
+python deploy/cloudflare/set_webhook.py --print-curl   # فقط نمایش دستور curl
+python deploy/cloudflare/set_webhook.py --remove        # بازگشت به polling
+```
+
+### ⚠️ پلن رایگان و هزینه
+
+تیم Cloudflare از **اوت ۲۰۲۶** صریحاً می‌گوید Containers فقط روی
+**Workers Paid (‏$5/ماه)** فعال است (`Free: N/A`). پس «Cloudflare Workers
+رایگان» برای این معماری **وجود ندارد**. اگر پلن رایگان می‌خواهید، از مسیر
+**Render** (بخش ۳) یا سرور+تونل (بخش ۳ فایل `WEBHOOK.md`) استفاده کنید —
+منطقِ کامل در `WEBHOOK.md` §۳ آمده است.
+
+خلاصهٔ معماری: کانتینر `python:3.12` کل ربات را اجرا می‌کند (بدون VPS)،
 `worker/index.js` فقط `POST WEBHOOK_PATH` و `GET /health` را به آن forward
 می‌کند، و `max_instances` باید ۱ بماند (حالت matching در حافظهٔ فرایند است).
 دیسک کانتینر موقتی است، پس دیتابیس همان PostgreSQL و FSM همان Redis است.
+جزئیات و چک‌لیست → [`deploy/cloudflare/README.md`](deploy/cloudflare/README.md).

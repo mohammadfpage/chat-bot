@@ -165,12 +165,16 @@ class Settings(BaseSettings):
 
     # ── FSM storage (used only by bot.py) ──
     # Empty = aiogram MemoryStorage (state dies with the process — fine for
-    # local polling). Set to a Redis URL (redis://… or rediss://…) to keep
-    # FSM states across container restarts/sleeps on Cloudflare, where the
-    # disk and the process are both ephemeral:
-    #   REDIS_URL=redis://default:<password>@<host>:6379/0
-    # Read lazily by build_fsm_storage(); a broken URL falls back to
-    # MemoryStorage with a logged warning instead of failing startup.
+    # local polling, but it also means a Render/Cloudflare sleep WIPES any
+    # half-finished profile wizard, which is why production MUST set this).
+    # Set to a Redis URL to keep FSM states across restarts/sleeps:
+    #   Upstash (TLS REQUIRED):  REDIS_URL=rediss://default:<password>@<region>.upstash.io:<port>
+    #   plain Redis:             REDIS_URL=redis://default:<password>@<host>:6379/0
+    # NB: Upstash only speaks TLS — a plain redis:// URL fails the handshake
+    # and every state read dies, so use the rediss:// endpoint it gives you.
+    # Read by build_fsm_storage() and pinged once by verify_fsm_storage();
+    # an unreachable/broken URL falls back to MemoryStorage with a logged
+    # ERROR instead of failing startup.
     redis_url: str = ""
 
     # ── Cloudflare ──

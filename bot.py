@@ -424,19 +424,32 @@ async def _spawn_keyboard_cleanup(bot: Bot) -> None:
 # FSM storage: MemoryStorage locally, Redis in the container
 # ──────────────────────────────────────────────────────────────
 
+#: How long the startup PING waits for Redis before deciding the backend is
+#: unusable. Short on purpose: a wrong host, a dropped port or a TLS mismatch
+#: must fail fast at boot instead of hanging the first FSM operation — and,
+#: through the ping, startup itself — forever.
+_FSM_PING_TIMEOUT = 5.0
+
+
 def build_fsm_storage(redis_url: str | None = None) -> BaseStorage:
     """Pick the aiogram FSM backend from ``REDIS_URL``.
 
     Local/default: ``MemoryStorage`` — state dies with the process, which is
     exactly right for a laptop that is restarted on purpose.
 
-    Container: a Redis URL keeps FSM states across the platform's stop/start
-    cycles, so a user mid-profile-setup or mid-queue does not lose their
-    place when the container sleeps. The URL is only *parsed* here (no
-    connection is opened until the first storage op), so a typo degrades to
-    MemoryStorage with a loud log instead of an import/startup crash — and
-    because the failure is logged as an error, an unreachable Redis in
-    production is visible rather than silently "working".
+    Production (Render/Cloudflare): a Redis URL keeps FSM states across the
+    platform's stop/start cycles, so a user mid-profile-setup or mid-queue
+    does not lose their place when the container sleeps — **but only if the
+    URL actually connects**. ``RedisStorage.from_url`` merely *parses* the URL
+    and opens no connection, so this function alone cannot tell a working
+    Upstash endpoint from a typo; ``verify_fsm_storage`` pings it at startup
+    for that. A URL that cannot even be parsed degrades to MemoryStorage with
+    a loud log instead of an import/startup crash.
+
+    Upstash (TLS) needs the **rediss://** scheme — with a plain ``redis://``
+    the TLS handshake never happens and every state read fails. The endpoint
+    is ``rediss://default:<password>@<region>.upstash.io:<port>``. Connect and
+    read sockets are bounded so a firewalled host fails fast rather than hangs.
 
     Passwords in the URL are masked in the log, same as ``PROXY_URL``.
     """
@@ -446,7 +459,13 @@ def build_fsm_storage(redis_url: str | None = None) -> BaseStorage:
     try:
         from aiogram.fsm.storage.redis import RedisStorage
 
-        storage = RedisStorage.from_url(url)
+        storage = RedisStorage.from_url(
+            url,
+            connection_kwargs={
+                "socket_connect_timeout": _FSM_PING_TIMEOUT,
+                "socket_timeout": _FSM_PING_TIMEOUT,
+            },
+        )
     except Exception as exc:  # noqa: BLE001 — a bad REDIS_URL must not stop boot
         logger.error(
             "REDIS_URL is set but unusable (%s) — falling back to MemoryStorage. "
@@ -454,6 +473,53 @@ def build_fsm_storage(redis_url: str | None = None) -> BaseStorage:
         )
         return MemoryStorage()
     logger.info("FSM storage: Redis (%s)", _mask_proxy(url))
+    return storage
+
+
+async def verify_fsm_storage(storage: BaseStorage) -> BaseStorage:
+    """Prove a Redis FSM backend is reachable, or fall back to memory.
+
+    ``build_fsm_storage`` cannot detect an *unreachable* Redis — parsing a URL
+    succeeds even for a dead host. That gap is the whole profile-loss bug in
+    production: the wizard carries age/city/gender ONLY in FSM state until
+    «✅ تایید», so a Redis that silently fails on the first write loses the
+    answers and the user can never finish. A single bounded ``PING`` here,
+    before any update is served, turns that into a loud startup error.
+
+    A failed ping falls back to MemoryStorage (the bot still runs) but logs at
+    ERROR, and the discarded Redis pool is closed so it cannot leak. A
+    MemoryStorage is returned untouched — there is nothing to reach.
+    """
+    redis = getattr(storage, "redis", None)
+    if redis is None:
+        return storage  # MemoryStorage: no connection to verify
+
+    try:
+        pong = await asyncio.wait_for(redis.ping(), timeout=_FSM_PING_TIMEOUT)
+    except Exception as exc:  # noqa: BLE001 — never let a bad Redis stop boot
+        logger.error(
+            "REDIS_URL is set but the server did not answer PING (%s: %s) — "
+            "falling back to MemoryStorage. FSM state (a half-finished "
+            "profile, a chat queue) will NOT survive a restart. Check the "
+            "Upstash URL: it must be rediss://… (TLS) with the right password.",
+            type(exc).__name__,
+            exc,
+        )
+        with suppress(Exception):
+            await storage.close()
+        return MemoryStorage()
+
+    if not pong:
+        logger.error(
+            "REDIS accepted the connection but PING returned a false value — "
+            "falling back to MemoryStorage; FSM state will NOT survive a "
+            "restart."
+        )
+        with suppress(Exception):
+            await storage.close()
+        return MemoryStorage()
+
+    logger.info("FSM storage ping OK — Redis reachable; state will persist.")
     return storage
 
 
@@ -508,7 +574,11 @@ async def build_bot_and_dispatcher() -> tuple[Bot, Dispatcher]:
     # MemoryStorage by default (local polling); RedisStorage when REDIS_URL
     # is set, which is what keeps a user's place in a wizard across host
     # restarts/sleeps (Render, Cloudflare, …). See build_fsm_storage.
+    # verify_fsm_storage pings it once so a misconfigured/unreachable Upstash
+    # is caught here, before any update is served, instead of on the first
+    # profile step the user takes.
     storage = build_fsm_storage(settings.redis_url)
+    storage = await verify_fsm_storage(storage)
 
     bot = Bot(
         token=settings.bot_token,
@@ -1086,6 +1156,13 @@ async def main() -> None:
         raise SystemExit(1)
     finally:
         await bot.session.close()
+        # Close the FSM storage too: a RedisStorage holds a connection pool
+        # that would otherwise be left open on shutdown (and a container
+        # stop/SIGTERM would leak it). MemoryStorage.close() is a no-op.
+        try:
+            await dp.storage.close()
+        except Exception as exc:  # pragma: no cover - best effort
+            logger.warning("Closing the FSM storage failed: %s", exc)
         # Flush/close every pooled SQLite connection (WAL files checkpoint on
         # close). Without this the process could exit with -wal/-shm siblings
         # still held open.

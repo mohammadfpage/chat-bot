@@ -11,7 +11,7 @@ all derive their behaviour from it instead of re-checking the URL.
 import logging
 import re
 
-from sqlalchemy import text
+from sqlalchemy import inspect as sa_inspect, text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -142,6 +142,14 @@ async def init_db() -> None:
                     "premium_until": "DATETIME",
                     "show_profile_photo": "BOOLEAN DEFAULT 0",
                     "profile_photo": "VARCHAR(512)",
+                    # Profile fields. They predate the gender column in most
+                    # databases, but a database created before the wizard
+                    # existed lacks them too — and without the columns the
+                    # wizard's final commit raises and nothing saves.
+                    "age": "INTEGER",
+                    "city": "VARCHAR(128)",
+                    "height": "VARCHAR(32)",
+                    "is_profile_complete": "BOOLEAN DEFAULT 0",
                     # Matching is charged, not whitelisted by a counter. Both
                     # flags default to 0, which is the safe direction: nobody
                     # becomes free of charge because a column appeared.
@@ -322,6 +330,75 @@ async def init_db() -> None:
             anon_columns = {row[1] for row in result.fetchall()}
             if "is_owner_replying" not in anon_columns:
                 await conn.execute(text("ALTER TABLE anonymous_messages ADD COLUMN is_owner_replying BOOLEAN DEFAULT 0"))
+
+        # ── Ensure the critical columns exist on EVERY backend ──
+        #
+        # ``Base.metadata.create_all`` only ever issues CREATE TABLE; it NEVER
+        # ALTERs a table that already exists. On a managed PostgreSQL (Neon,
+        # Supabase, …) whose ``users`` table was created by an older build, a
+        # column added to the model afterwards — ``gender``,
+        # ``is_profile_complete``, ``age``, ``city`` … — is therefore simply
+        # ABSENT, and because the ORM reads and writes every mapped column, the
+        # breakage is not confined to that one field: loading or saving a
+        # profile raises ``UndefinedColumn`` and NOTHING is persisted. The
+        # migration block above runs only ``if dialect == "sqlite"``, so
+        # PostgreSQL never healed itself — which is exactly the
+        # "some things just do not save on Neon" symptom.
+        #
+        # This step runs on both backends, reflects the live columns and adds
+        # whatever is missing with portable DDL (every type below is valid on
+        # SQLite AND PostgreSQL). It is idempotent: existing columns are
+        # skipped, so it is safe on every restart.
+        critical_columns = {
+            "users": {
+                "age": "INTEGER",
+                "city": "VARCHAR(128)",
+                "height": "VARCHAR(32)",
+                "gender": "VARCHAR(8)",
+                "is_profile_complete": "BOOLEAN DEFAULT FALSE",
+                "show_profile_photo": "BOOLEAN DEFAULT FALSE",
+                "profile_photo": "VARCHAR(512)",
+                "is_admin": "BOOLEAN DEFAULT FALSE",
+                "is_banned": "BOOLEAN DEFAULT FALSE",
+                "coins": "DOUBLE PRECISION DEFAULT 0",
+                "has_subscription": "BOOLEAN DEFAULT FALSE",
+                "is_exempt": "BOOLEAN DEFAULT FALSE",
+                "is_vip": "BOOLEAN DEFAULT FALSE",
+                "last_daily_bonus": "TIMESTAMP",
+                "premium_until": "TIMESTAMP",
+                "referred_by": "BIGINT",
+                "referral_count": "INTEGER DEFAULT 0",
+                # Any mapped column that is absent breaks the ORM's SELECT as
+                # a whole, so the metadata timestamp is healed too. The default
+                # is a CONSTANT literal on purpose: SQLite refuses
+                # ``ADD COLUMN … DEFAULT CURRENT_TIMESTAMP`` ("non-constant
+                # default"), while a quoted timestamp is accepted by both
+                # SQLite and PostgreSQL.
+                "registered_at": "TIMESTAMP DEFAULT '1970-01-01 00:00:00'",
+            },
+        }
+
+        def _reflected_columns(sync_conn, table: str) -> set[str]:
+            """Columns that physically exist in ``table`` right now."""
+            return {
+                column["name"]
+                for column in sa_inspect(sync_conn).get_columns(table)
+            }
+
+        for table, columns in critical_columns.items():
+            table = _ident(table)
+            existing = await conn.run_sync(_reflected_columns, table)
+            for col, ddl in columns.items():
+                col = _ident(col)
+                if col not in existing:
+                    await conn.execute(
+                        text(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+                    )
+                    logger.info(
+                        "Added missing column %s.%s (schema self-heal).",
+                        table,
+                        col,
+                    )
 
 
 async def get_session() -> AsyncSession:

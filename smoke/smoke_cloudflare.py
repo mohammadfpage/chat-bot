@@ -356,6 +356,69 @@ check("wrangler pinned as a dev dependency",
       pkg.get("devDependencies"))
 check("worker module is ESM", pkg.get("type") == "module", pkg.get("type"))
 
+# ── 11b. CLI ergonomics: deployable from the repo root ──
+# `image_build_context` lets the image build in place with the repo root as
+# context (Dockerfile needs requirements.txt + the bot source). Relative paths
+# resolve against the config file, so `-c deploy/cloudflare/wrangler.jsonc`
+# from the root behaves like running wrangler inside the folder.
+check("container builds with the repo-root context",
+      cont.get("image_build_context") == "../..", cont.get("image_build_context"))
+_scripts = pkg.get("scripts", {})
+check("npm cf:* scripts exist",
+      {"cf:dev", "cf:deploy", "cf:tail", "cf:secret", "cf:check"} <= set(_scripts),
+      sorted(_scripts))
+check("cf:check is an offline dry-run",
+      "--dry-run" in _scripts.get("cf:check", "")
+      and "--containers-rollout=none" in _scripts.get("cf:check", ""),
+      _scripts.get("cf:check"))
+
+# Root .dockerignore is what actually applies when context = repo root.
+root_di = (ROOT / ".dockerignore").read_text(encoding="utf-8")
+_root_di_lines = {ln.strip() for ln in root_di.splitlines() if ln.strip()}
+check("root .dockerignore keeps secrets out",
+      {".env", ".env.*", ".dev.vars"} <= _root_di_lines, _root_di_lines)
+check("root .dockerignore keeps venv/db/node_modules out",
+      {"venv/", "*.db", "node_modules/", "**/node_modules/"}
+      <= _root_di_lines, _root_di_lines)
+check("root .dockerignore re-includes the safe example",
+      "!.env.example" in _root_di_lines and "!.dev.vars.example" in _root_di_lines,
+      _root_di_lines)
+
+# Local-dev secrets template + git ignore
+dev_example = CF / ".dev.vars.example"
+check(".dev.vars.example shipped", dev_example.exists())
+_dev = dev_example.read_text(encoding="utf-8")
+for _k in ("BOT_TOKEN=", "DATABASE_URL=", "RUN_MODE=webhook", "ADMIN_IDS=",
+           "WEBHOOK_SECRET=", "WEBHOOK_BASE_URL="):
+    check(f".dev.vars.example documents {_k}", _k in _dev)
+check(".gitignore ignores .dev.vars (never the example)",
+      ".dev.vars" in (ROOT / ".gitignore").read_text(encoding="utf-8")
+      and "!.dev.vars.example" in (ROOT / ".gitignore").read_text(encoding="utf-8"))
+
+# set_webhook.py helper — load it and exercise its pure URL logic offline
+import importlib.util  # noqa: E402
+
+_sw_spec = importlib.util.spec_from_file_location("cf_set_webhook", CF / "set_webhook.py")
+sw = importlib.util.module_from_spec(_sw_spec)
+_sw_spec.loader.exec_module(sw)  # raises → smoke fails on an import error
+check("set_webhook derives the webhook URL from the origin",
+      sw._resolve_url("https://anon-chat-bot.example.workers.dev")
+      == "https://anon-chat-bot.example.workers.dev/telegram/webhook",
+      sw._resolve_url("https://anon-chat-bot.example.workers.dev"))
+check("set_webhook accepts a full URL unchanged",
+      sw._resolve_url("https://x.example.com/tg-hook")
+      == "https://x.example.com/tg-hook")
+try:
+    sw._resolve_url("http://insecure.example.com")
+    check("set_webhook rejects a plain-http origin", False)
+except ValueError:
+    check("set_webhook rejects a plain-http origin", True)
+try:
+    sw._resolve_url("")
+    check("set_webhook rejects an empty URL", False)
+except ValueError:
+    check("set_webhook rejects an empty URL", True)
+
 # ── 12. the CURRENT deployment path must NOT be Cloudflare/Docker ──
 # None of the Wrangler/Docker triggers may sit in the repository root, or a
 # Python host could auto-detect a Node/Worker project and run

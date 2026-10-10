@@ -1,0 +1,46 @@
+# Docker ignore for the OPTIONAL Cloudflare Containers image.
+#
+# The image's build context is the REPOSITORY ROOT (see
+# deploy/cloudflare/wrangler.jsonc → containers[0].image_build_context),
+# so Docker reads this file, not deploy/cloudflare/.dockerignore. Keeping
+# secrets, the virtualenv and local runtime state out of the image is a
+# security requirement, not an optimization: the image is uploaded to
+# Cloudflare's container registry.
+
+# Secrets & local config — the Worker forwards them as env vars instead.
+.env
+.env.*
+!.env.example
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+*.bak
+
+# Local state: databases, WAL siblings, backups, logs
+*.db
+*.db-wal
+*.db-shm
+backups/
+logs/
+
+# VCS / agent / editor tooling
+.git/
+.github/
+.opencode/
+.vscode/
+.idea/
+
+# Python build artifacts & virtualenvs (any depth)
+venv/
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Node / Wrangler tooling (any depth — deploy/cloudflare/node_modules etc.)
+node_modules/
+**/node_modules/
+.wrangler/
+**/.wrangler/

@@ -5,11 +5,12 @@
 # this image — see README.md. This file is kept here so the Cloudflare
 # Containers option can be restored later without rewriting it.
 #
-# To actually build it, the Docker build context must contain requirements.txt
-# and the bot source (i.e. the repository root). Wrangler uses the directory
-# of its config file as the context, so `deploy/cloudflare/` alone cannot see
-# them: copy the files back to the repo root (or point the build context there)
-# before running `npx wrangler deploy`. See deploy/cloudflare/README.md.
+# To build it, the Docker build context must contain requirements.txt and the
+# bot source (i.e. the repository root). wrangler.jsonc sets
+# `image_build_context: "../.."` so `npx wrangler deploy -c
+# deploy/cloudflare/wrangler.jsonc` builds IN PLACE with the repo root as the
+# context — no need to copy files into the root. The repo-root `.dockerignore`
+# is what keeps .env/.dev.vars/venv/databases/node_modules out of the image.
 #
 # Constraints imposed by the platform:
 #   * linux/amd64 only — the architecture Cloudflare runs

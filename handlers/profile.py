@@ -2,6 +2,8 @@
 Profile setup FSM flow, profile viewing, and blocked-users management.
 """
 
+import logging
+
 from aiogram import Router, F
 from aiogram.enums import ChatType
 from aiogram.filters import StateFilter
@@ -38,6 +40,8 @@ from utils.economy import (
     fmt_coins,
     reason_label,
 )
+
+logger = logging.getLogger(__name__)
 
 router = Router()
 
@@ -282,20 +286,75 @@ async def process_height(message: Message, state: FSMContext) -> None:
 
 @router.message(ProfileSetup.waiting_for_confirm, F.text == "✅ تایید")
 async def confirm_profile(message: Message, state: FSMContext) -> None:
-    """Persist the completed profile after confirmation, then ask about the photo."""
+    """Persist the completed profile after confirmation, then ask about the photo.
+
+    This is the ONE moment the wizard's answers (which live only in FSM state)
+    reach the database, so it has to be both complete and honest about failure:
+
+    * An answer missing from the state — a Redis/Memory hiccup, or a state key
+      written by an older build — must not become a ``KeyError`` that kills the
+      handler with no message to the user. It is detected up front and the user
+      is asked to redo the setup.
+    * ``/start`` normally creates the ``users`` row, but if it is absent
+      (registration race, a database that predates the row) the profile is
+      written as ``INSERT`` rather than silently skipped by an ``if user:``.
+    * A failed commit is logged with the real exception and reported to the
+      user, and the confirmation keyboard is kept so «✅ تایید» can be tapped
+      again — instead of the old behaviour where a commit error vanished into
+      the logs while the user saw nothing.
+    """
     data = await state.get_data()
-    async with async_session_factory() as session:
-        result = await session.execute(
-            select(User).where(User.telegram_id == message.from_user.id)
+
+    missing = [k for k in ("age", "city", "gender", "height") if data.get(k) in (None, "")]
+    if missing:
+        logger.warning(
+            "Profile confirm: incomplete FSM data for %s (missing %s)",
+            message.from_user.id,
+            ", ".join(missing),
         )
-        user = result.scalar_one_or_none()
-        if user:
+        await state.set_state(ChatState.idle)
+        await message.answer(
+            "⚠️ اطلاعات پروفایل ناقص است. لطفاً دوباره «👤 پروفایل من» را بزنید "
+            "و مراحل را از ابتدا کامل کنید.",
+            reply_markup=main_menu_kb(),
+        )
+        return
+
+    try:
+        # The commit happens INSIDE the ``async with`` block — the session is
+        # closed only after the transaction is durable, never before.
+        async with async_session_factory() as session:
+            result = await session.execute(
+                select(User).where(User.telegram_id == message.from_user.id)
+            )
+            user = result.scalar_one_or_none()
+            if user is None:
+                # The row should already exist; recreate it rather than throw
+                # the whole completed wizard away on a registration race.
+                user = User(
+                    telegram_id=message.from_user.id,
+                    first_name=message.from_user.first_name,
+                    username=message.from_user.username,
+                )
+                session.add(user)
             user.age = data["age"]
             user.city = data["city"]
             user.height = data["height"]
             user.gender = data.get("gender")
             user.is_profile_complete = True
             await session.commit()
+    except Exception:
+        logger.exception(
+            "Profile commit failed for telegram_id=%s", message.from_user.id
+        )
+        await message.answer(
+            "⚠️ ذخیرهٔ پروفایل با خطا مواجه شد. لطفاً چند لحظه بعد دوباره "
+            "«✅ تایید» را بزنید.",
+            reply_markup=confirm_profile_kb(),
+        )
+        return
+
+    logger.info("Profile completed for telegram_id=%s", message.from_user.id)
 
     # ── Final question: show profile photo or not (separate step, not nested) ──
     await state.set_state(ProfileSetup.waiting_for_photo_choice)

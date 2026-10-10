@@ -1,0 +1,51 @@
+# ─────────────────────────────────────────────────────────────────────────
+# LOCAL secrets for `wrangler dev` (Cloudflare Containers).
+#
+# Copy this file to `.dev.vars` (which is git-ignored) and fill in real
+# values:
+#     Copy-Item .dev.vars.example .dev.vars     # PowerShell
+#     cp .dev.vars.example .dev.vars            # bash
+#
+# Wrangler reads `.dev.vars` from THIS directory (the directory of
+# wrangler.jsonc) whether it is started from the repo root with
+# `-c deploy/cloudflare/wrangler.jsonc` or from inside this folder. It is
+# the local-dev equivalent of production secrets, which are stored with:
+#     npx wrangler secret put BOT_TOKEN -c deploy/cloudflare/wrangler.jsonc
+#     npx wrangler secret put WEBHOOK_SECRET -c deploy/cloudflare/wrangler.jsonc
+#     npx wrangler secret put DATABASE_URL -c deploy/cloudflare/wrangler.jsonc
+#     npx wrangler secret put REDIS_URL -c deploy/cloudflare/wrangler.jsonc
+#     npx wrangler secret put PROXY_URL -c deploy/cloudflare/wrangler.jsonc
+# ─────────────────────────────────────────────────────────────────────────
+
+# REQUIRED — real token from @BotFather (same as the root .env BOT_TOKEN).
+BOT_TOKEN=123456789:REPLACE_WITH_YOUR_REAL_BOT_TOKEN
+
+# REQUIRED — managed PostgreSQL (Cloudflare's container disk is ephemeral;
+# the bot REFUSES to boot inside a container with a SQLite URL).
+DATABASE_URL=postgresql+asyncpg://user:password@host:5432/anon_chat
+
+# REQUIRED in webhook mode — the public https:// origin Telegram posts to.
+# Production: the https://<name>.<account>.workers.dev URL printed by the
+# first `wrangler deploy`. Local test: a tunnel, e.g.
+#   cloudflared tunnel --url http://127.0.0.1:8080
+# Leaving it empty is fine — the bot then exits with a clear instruction
+# instead of registering a broken webhook.
+WEBHOOK_BASE_URL=
+
+# REQUIRED — every delivery must carry a matching
+# X-Telegram-Bot-Api-Secret-Token header, so this value must equal the
+# Worker's WEBHOOK_SECRET. 1-256 chars from A-Z a-z 0-9 _ - only.
+WEBHOOK_SECRET=REPLACE_WITH_A_LONG_RANDOM_STRING
+
+# OPTIONAL — managed Redis keeps FSM wizard state across container sleeps.
+# Leave empty to use in-process MemoryStorage (state lost on a cold start).
+# REDIS_URL=redis://default:password@host:6379/0
+
+# OPTIONAL — reach api.telegram.org through a proxy (socks5://, socks4://,
+# socks5h://, http://, user:pass@host). Needed in filtered regions.
+# PROXY_URL=socks5://127.0.0.1:1080
+
+# The two below already come from wrangler.jsonc "vars" — repeated here only
+# to document them. Change them here to override for local dev.
+RUN_MODE=webhook
+ADMIN_IDS=7174138646

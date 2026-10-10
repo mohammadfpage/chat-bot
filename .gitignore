@@ -25,6 +25,11 @@ logs/
 node_modules/
 .wrangler/
 
+# Wrangler local secrets (Cloudflare `wrangler dev`) — never commit
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+
 # Editor / agent tooling
 .opencode/node_modules/
 .vscode/

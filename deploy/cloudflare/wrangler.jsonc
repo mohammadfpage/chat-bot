@@ -4,6 +4,14 @@
 // Web Service (Render, see README.md) and must NOT run `npx wrangler deploy`.
 // This file lives outside the repo root on purpose so no platform auto-detects
 // a Worker project. See deploy/cloudflare/README.md to restore this option.
+//
+// It is still fully runnable FROM the repo root — every command just has to
+// point Wrangler at this file (or at its directory):
+//   npx wrangler deploy -c deploy/cloudflare/wrangler.jsonc
+//   npx wrangler dev    -c deploy/cloudflare/wrangler.jsonc
+// Relative paths below (`main`, `image`, `image_build_context`) are resolved
+// against THIS file's directory, never the shell's cwd, so the commands above
+// behave exactly like running Wrangler from inside deploy/cloudflare/.
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "anon-chat-bot",
@@ -17,7 +25,17 @@
     {
       "class_name": "BotContainer",
       "image": "./Dockerfile",
-      "max_instances": 1
+      "max_instances": 1,
+
+      // The container image needs requirements.txt + the bot source, which
+      // live at the REPOSITORY ROOT, not here. By default the build context
+      // is the Dockerfile's directory (this folder), where those files do not
+      // exist. Overriding it to the repo root makes `wrangler deploy` build
+      // in place — no need to copy files back into the root. The path is
+      // resolved relative to this config file; the root `.dockerignore`
+      // (applied because the context changed) keeps .env, venv/, *.db*,
+      // backups/ and node_modules/ out of the image.
+      "image_build_context": "../.."
     }
   ],
 
