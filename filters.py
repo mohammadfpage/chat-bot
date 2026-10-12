@@ -10,6 +10,7 @@ from sqlalchemy import select
 
 from config import settings
 from database import async_session_factory, User
+from utils.user_flags import load_user_flags
 
 
 class IsAdmin(BaseFilter):
@@ -19,25 +20,18 @@ class IsAdmin(BaseFilter):
       2. an admin promoted dynamically in the database (``User.is_admin``).
 
     The panel is therefore completely invisible to normal users.
+
+    Answered through :func:`utils.user_flags.load_user_flags` so the admin
+    flag is fetched and cached together with the banned flag the middlewares
+    already ask for — one query instead of a separate ``SELECT`` per check.
     """
 
     async def __call__(self, event: TelegramObject, **kwargs: Any) -> bool:
         user = event.from_user
         if not user:
             return False
-
-        # Root Admins (from .env) — ultimate power, always trusted.
-        # Explicit int() cast prevents str-vs-int mismatch from env parsing.
-        if int(user.id) in settings.admin_ids_list:
-            return True
-
-        # Dynamically promoted admins.
-        async with async_session_factory() as session:
-            result = await session.execute(
-                select(User).where(User.telegram_id == user.id)
-            )
-            db_user = result.scalar_one_or_none()
-            return bool(db_user and db_user.is_admin)
+        # Root Admins short-circuit inside load_user_flags (no DB round trip).
+        return (await load_user_flags(user.id))[0]
 
 
 class IsRootAdmin(BaseFilter):

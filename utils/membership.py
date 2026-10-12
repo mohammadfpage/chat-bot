@@ -15,6 +15,7 @@ that hit a content restriction).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass
@@ -111,9 +112,26 @@ def join_bullet(chat: ChatRef) -> str:
     return f"• {title}"
 
 
+#: The panel's ``required_channels`` list changes only when an admin edits it,
+#: yet every force-join check on every update used to re-read the whole table.
+#: Cached briefly and invalidated through :func:`clear_membership_cache` — the
+#: single call the admin panel and the join flow already make — so no call site
+#: has to remember a second cache exists.
+_CHANNELS_TTL = 30.0
+_channels_cache: list["ChatRef"] | None = None
+_channels_cache_at: float = 0.0
+
+
 def clear_membership_cache() -> None:
-    """Drop every cached membership answer (after a successful join)."""
+    """Drop every cached membership answer AND the cached channel list.
+
+    Called after a successful join and after any admin edit of the required
+    channels, so both caches stay consistent with the database.
+    """
+    global _channels_cache, _channels_cache_at
     _cache.clear()
+    _channels_cache = None
+    _channels_cache_at = 0.0
 
 
 async def get_chat_member_status(bot, chat_ref: int | str, user_id: int) -> str | None:
@@ -189,7 +207,19 @@ async def force_sub_enabled() -> bool:
 
 
 async def configured_channels() -> list[ChatRef]:
-    """Every channel the admin listed in the ``required_channels`` table."""
+    """Every channel the admin listed in the ``required_channels`` table.
+
+    Cached for :data:`_CHANNELS_TTL`: the list is read on the hot force-join
+    path for every update but written only from the admin panel, which calls
+    :func:`clear_membership_cache` on each edit. A copy is returned so a caller
+    cannot mutate the cached list.
+    """
+    global _channels_cache, _channels_cache_at
+
+    now = time.monotonic()
+    if _channels_cache is not None and (now - _channels_cache_at) < _CHANNELS_TTL:
+        return list(_channels_cache)
+
     try:
         async with async_session_factory() as session:
             result = await session.execute(
@@ -200,11 +230,12 @@ async def configured_channels() -> list[ChatRef]:
             rows = result.scalars().all()
     except Exception as exc:
         # A missing/unmigrated table must not take the whole bot down; the
-        # legacy + env channels below still apply.
+        # legacy + env channels below still apply. Not cached: the next call
+        # should retry once the schema is healed.
         logger.warning("Could not read required_channels: %s", exc)
         return []
 
-    return [
+    channels = [
         ChatRef(
             ref=row.chat_id,
             title=row.title or (f"@{row.username}" if row.username else str(row.chat_id)),
@@ -214,6 +245,9 @@ async def configured_channels() -> list[ChatRef]:
         )
         for row in rows
     ]
+    _channels_cache = channels
+    _channels_cache_at = now
+    return list(channels)
 
 
 async def required_chats() -> list[ChatRef]:
@@ -297,13 +331,22 @@ async def missing_required_chats(
     if not await force_sub_enabled():
         return []
 
-    missing: list[ChatRef] = []
-    for chat in await required_chats():
-        if not await is_member(
-            bot, chat.api_ref, user_id, force_refresh=force_refresh
-        ):
-            missing.append(chat)
-    return missing
+    chats = await required_chats()
+    if not chats:
+        return []
+
+    # Ask Telegram about every channel AT ONCE. The lookups are independent
+    # ``get_chat_member`` calls, and running them sequentially made the update
+    # wait for the sum of their round trips (two channels × ~0.3 s each instead
+    # of ~0.3 s total). ``is_member`` already fails open and never raises, so
+    # ``gather`` cannot turn one bad channel into a failed update.
+    results = await asyncio.gather(
+        *(
+            is_member(bot, chat.api_ref, user_id, force_refresh=force_refresh)
+            for chat in chats
+        )
+    )
+    return [chat for chat, ok in zip(chats, results) if not ok]
 
 
 async def resolve_chat_ref(

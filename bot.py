@@ -71,6 +71,8 @@ from middleware import (
     GroupKeyboardWatchMiddleware,
     GroupMemberWatchMiddleware,
     ReplyKeyboardGuardMiddleware,
+    TimingMiddleware,
+    TimingStorage,
     install_keyboard_guard,
 )
 from middleware.keyboard_guard import GuardedSession
@@ -430,6 +432,25 @@ async def _spawn_keyboard_cleanup(bot: Bot) -> None:
 #: through the ping, startup itself — forever.
 _FSM_PING_TIMEOUT = 5.0
 
+#: Hosts that can only ever speak TLS. Upstash prints a ``redis://`` URL in the
+#: console (it is the one ``redis-cli --tls`` wants), but redis-py honours the
+#: scheme and would skip the handshake entirely, so a plain-scheme Upstash URL
+#: is upgraded here rather than failing every FSM read.
+_TLS_ONLY_HOSTS = (".upstash.io",)
+
+
+def _ensure_redis_tls(url: str) -> str:
+    """Upgrade ``redis://`` to ``rediss://`` for TLS-only managed hosts."""
+    host = (urlsplit(url).hostname or "").lower()
+    if url.startswith("redis://") and host.endswith(_TLS_ONLY_HOSTS):
+        logger.warning(
+            "REDIS_URL is a plain redis:// URL for a TLS-only host (%s) — "
+            "upgrading to rediss:// automatically.",
+            host,
+        )
+        return "rediss://" + url[len("redis://"):]
+    return url
+
 
 def build_fsm_storage(redis_url: str | None = None) -> BaseStorage:
     """Pick the aiogram FSM backend from ``REDIS_URL``.
@@ -456,14 +477,24 @@ def build_fsm_storage(redis_url: str | None = None) -> BaseStorage:
     url = (settings.redis_url if redis_url is None else redis_url or "").strip()
     if not url:
         return MemoryStorage()
+    url = _ensure_redis_tls(url)
     try:
         from aiogram.fsm.storage.redis import RedisStorage
 
         storage = RedisStorage.from_url(
             url,
             connection_kwargs={
+                # A firewalled/typo'd host must fail fast, not hang the first
+                # FSM operation forever.
                 "socket_connect_timeout": _FSM_PING_TIMEOUT,
                 "socket_timeout": _FSM_PING_TIMEOUT,
+                # Managed Redis over TLS drops idle connections; keepalive plus
+                # a periodic health check means the pool hands back live
+                # sockets instead of the first checkout after a quiet spell
+                # paying a dead-connection retry.
+                "socket_keepalive": True,
+                "health_check_interval": 30,
+                "retry_on_timeout": True,
             },
         )
     except Exception as exc:  # noqa: BLE001 — a bad REDIS_URL must not stop boot
@@ -579,6 +610,10 @@ async def build_bot_and_dispatcher() -> tuple[Bot, Dispatcher]:
     # profile step the user takes.
     storage = build_fsm_storage(settings.redis_url)
     storage = await verify_fsm_storage(storage)
+    # Wrap only AFTER the startup PING has decided the backend is usable: the
+    # proxy delegates ``redis`` (used by the ping) but there is nothing to
+    # measure on the ping itself. From here every FSM call is timed.
+    storage = TimingStorage(storage)
 
     bot = Bot(
         token=settings.bot_token,
@@ -593,8 +628,12 @@ async def build_bot_and_dispatcher() -> tuple[Bot, Dispatcher]:
     # forgets its ChatType filter. Must be installed after the Bot exists.
     install_keyboard_guard(bot)
 
-    # ── Middleware (order matters: keyboard-guard → ban-block → force-join) ──
-    # The keyboard guard goes first so it is the OUTERMOST wrapper: it publishes
+    # ── Middleware (order matters: timing → keyboard-guard → ban-block → force-join) ──
+    # Timing is the OUTERMOST wrapper so its number is the total the user
+    # actually waited through, every other middleware included.
+    dp.message.outer_middleware(TimingMiddleware())
+    dp.callback_query.outer_middleware(TimingMiddleware())
+    # The keyboard guard goes next so it wraps everything below and publishes
     # the incoming chat's type for the duration of the handler, which lets the
     # session guard skip a get_chat call even for messages sent by the
     # force-join middleware below.

@@ -1,0 +1,20 @@
+[project]
+name = "anon-chat-python-worker"
+version = "0.1.0"
+description = "Free-tier Cloudflare Python Worker prototype for the anon chat bot"
+requires-python = ">=3.13"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "workers-py",
+    "workers-runtime-sdk",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py313"

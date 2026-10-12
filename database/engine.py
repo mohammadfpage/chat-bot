@@ -10,8 +10,9 @@ all derive their behaviour from it instead of re-checking the URL.
 
 import logging
 import re
+import time
 
-from sqlalchemy import inspect as sa_inspect, text
+from sqlalchemy import event, inspect as sa_inspect, text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -64,10 +65,35 @@ def engine_options(url: str) -> dict:
         return {"connect_args": {"timeout": 30}}
     if url.startswith("postgres"):
         return {
-            "connect_args": {"server_settings": {"timezone": "UTC"}},
+            "connect_args": {
+                "server_settings": {"timezone": "UTC"},
+                # PgBouncer — which is what Neon's *pooled* endpoint
+                # (``…-pooler.…``) speaks — runs in transaction mode and hands
+                # each transaction to a possibly different server backend. A
+                # prepared statement cached on one backend is therefore
+                # invisible, or collides, on the next, and asyncpg raises
+                # ``prepared statement "__asyncpg_stmt_N__" already exists``.
+                # Disabling BOTH caches (the SQLAlchemy dialect's and asyncpg's
+                # own) is the documented fix for a pooled connection string;
+                # the driver still uses unnamed statements, so there is no
+                # extra network round trip.
+                "statement_cache_size": 0,
+                "prepared_statement_cache_size": 0,
+            },
+            # Sized for one process that may run handlers, background sweeps
+            # and the rebuild-on-wake at once. Deliberately NOT larger: every
+            # idle connection is a server-side backend Neon likes to reap.
             "pool_size": 10,
             "max_overflow": 20,
-            "pool_recycle": 1800,
+            # Neon suspends an idle compute and its pooler closes idle client
+            # connections; rotating well inside that window means the first
+            # checkout of a quiet period never pays a dead-connection round
+            # trip (with ``pool_pre_ping`` touched up below in that case).
+            "pool_recycle": 300,
+            # LIFO keeps a small hot set of connections in rotation, so the
+            # pool idles a few connections instead of waking all ten and then
+            # letting them age out together.
+            "pool_use_lifo": True,
         }
     return {}
 
@@ -82,8 +108,6 @@ engine = create_async_engine(
 
 
 if settings.database_dialect == "sqlite":
-    from sqlalchemy import event
-
     @event.listens_for(engine.sync_engine, "connect")
     def _sqlite_pragmas(dbapi_connection, _record) -> None:
         """Per-connection SQLite hardening.
@@ -101,6 +125,40 @@ if settings.database_dialect == "sqlite":
             cursor.execute("PRAGMA busy_timeout=5000")
         finally:
             cursor.close()
+
+# ── Query timing ────────────────────────────────────────
+# One line per statement that outruns PERF_SLOW_MS, plus a DEBUG line for the
+# rest. The parameters are deliberately NOT logged: they are user content (a
+# whisper body, a phone-number-shaped value) and would turn the log into a
+# second copy of the database. This is the measurement that separates "the
+# network is slow" from "the query is slow" — a 550 ms ``SELECT 1`` proves the
+# former, a 550 ms ``SELECT`` over a real table proves the latter.
+_SLOW_QUERY_MS = float(settings.perf_slow_ms or 0)
+
+
+def _query_summary(statement: str) -> str:
+    """Collapse a SQL statement to one readable, length-bounded line."""
+    flat = " ".join((statement or "").split())
+    return flat[:200] + ("…" if len(flat) > 200 else "")
+
+
+@event.listens_for(engine.sync_engine, "before_cursor_execute")
+def _perf_before_cursor(conn, cursor, statement, parameters, context, executemany):
+    conn.info["_perf_query_start"] = time.perf_counter()
+
+
+@event.listens_for(engine.sync_engine, "after_cursor_execute")
+def _perf_after_cursor(conn, cursor, statement, parameters, context, executemany):
+    started = conn.info.pop("_perf_query_start", None)
+    if started is None:
+        return
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    if elapsed_ms >= _SLOW_QUERY_MS:
+        logger.warning(
+            "slow DB query %.0fms | %s", elapsed_ms, _query_summary(statement)
+        )
+    else:
+        logger.debug("DB query %.0fms | %s", elapsed_ms, _query_summary(statement))
 
 # ── Session factory ─────────────────────────────────────
 async_session_factory = async_sessionmaker(

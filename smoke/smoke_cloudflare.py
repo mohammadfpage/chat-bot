@@ -87,7 +87,13 @@ check("postgres pins timezone UTC",
       pgopts)
 check("postgres pool sized for the container",
       (pgopts.get("pool_size"), pgopts.get("max_overflow"), pgopts.get("pool_recycle"))
-      == (10, 20, 1800), pgopts)
+      == (10, 20, 300), pgopts)
+check("postgres uses LIFO pool rotation",
+      pgopts.get("pool_use_lifo") is True, pgopts)
+check("postgres disables statement caches for PgBouncer",
+      pgopts.get("connect_args", {}).get("statement_cache_size") == 0
+      and pgopts.get("connect_args", {}).get("prepared_statement_cache_size") == 0,
+      pgopts)
 check("unknown backend gets no options", engine_options("mysql://h/db") == {})
 
 # ── 3. dependency pins ──

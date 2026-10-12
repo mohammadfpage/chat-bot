@@ -5,6 +5,7 @@ All settings live in .env — no database tables needed.
 
 import logging
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -15,6 +16,42 @@ logger = logging.getLogger(__name__)
 # happens to be started from (systemd, a scheduler, or a shell in another
 # folder would otherwise look for .env / database.db in the wrong place).
 BASE_DIR = Path(__file__).resolve().parent
+
+
+#: Query params an asyncpg connection string must NOT carry, and the asyncpg
+#: equivalent of the one that must be rewritten. libpq (psql, pg_dump, the Neon
+#: dashboard) speaks ``sslmode``/``channel_binding``; asyncpg does not — it
+#: accepts an ``ssl`` value and has no channel-binding switch. SQLAlchemy's
+#: asyncpg dialect forwards every unknown query key straight to ``connect()``
+#: as a keyword argument, so a dashboard URL pasted verbatim used to explode at
+#: the first connection with ``TypeError: connect() got an unexpected keyword
+#: argument 'sslmode'``. Renaming/dropping them here is what makes the common
+#: paste-and-go work; an explicitly asyncpg-flavoured URL (already using
+#: ``ssl=…``) is left untouched.
+_DROP_PG_QUERY_KEYS = {"channel_binding"}
+_RENAME_PG_QUERY_KEYS = {"sslmode": "ssl"}
+
+
+def _sanitize_asyncpg_url(url: str) -> str:
+    """Rewrite libpq query params to the asyncpg dialect's vocabulary.
+
+    Only ``sslmode`` (→ ``ssl``) and ``channel_binding`` (dropped) are touched;
+    every other query key is preserved so driver-specific options such as
+    ``sslrootcert`` or ``server_settings`` keep working.
+    """
+    parts = urlsplit(url)
+    if not parts.query:
+        return url
+    kept: list[tuple[str, str]] = []
+    for key, value in parse_qsl(parts.query, keep_blank_values=True):
+        low = key.lower()
+        if low in _DROP_PG_QUERY_KEYS:
+            continue
+        if low in _RENAME_PG_QUERY_KEYS:
+            kept.append((_RENAME_PG_QUERY_KEYS[low], value))
+            continue
+        kept.append((key, value))
+    return urlunsplit(parts._replace(query=urlencode(kept)))
 
 
 class Settings(BaseSettings):
@@ -136,6 +173,16 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_file: str = "logs/bot.log"
 
+    # ── Performance logging ──
+    # PERF_SLOW_MS — anything slower than this many milliseconds at one of the
+    # three latency-sensitive hops (whole update, one DB statement, one FSM
+    # storage call) is logged at WARNING; anything faster is logged at DEBUG,
+    # so the console stays readable but `LOG_LEVEL=DEBUG` shows the full
+    # breakdown. This is the switch that turns "the buttons feel slow" into
+    # "the force-join middleware spent 2.3s in get_chat_member". Set to 0 to
+    # log every single operation (very chatty — only for a diagnosis run).
+    perf_slow_ms: float = 150.0
+
     # ── Retention (days; 0 = keep forever) ──
     # Swept once a day by utils.retention, started at boot. Private message
     # bodies should not outlive the conversations they belong to; the ledger
@@ -205,6 +252,8 @@ class Settings(BaseSettings):
             url = "postgresql+asyncpg://" + url[len("postgres://"):]
         elif url.startswith("postgresql://"):
             url = "postgresql+asyncpg://" + url[len("postgresql://"):]
+        if url.startswith("postgresql+asyncpg://"):
+            url = _sanitize_asyncpg_url(url)
         self.database_url = url
         return self
 

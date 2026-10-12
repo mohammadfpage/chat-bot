@@ -36,10 +36,6 @@ from aiogram.types import (
     InputTextMessageContent,
     Message,
 )
-from sqlalchemy import select
-
-from config import settings
-from database import async_session_factory, User
 from keyboards.inline import force_join_kb
 from utils.membership import (
     ChatRef,
@@ -137,25 +133,23 @@ _INLINE_DESCRIPTION = "عضویت در کانال‌ها فقط در گفتگو�
 
 
 async def _is_admin(user_id: int) -> bool:
-    """Cheap admin check for middleware (root OR db flag)."""
-    if user_id in settings.admin_ids_list:
-        return True
-    async with async_session_factory() as session:
-        result = await session.execute(
-            select(User).where(User.telegram_id == user_id)
-        )
-        db_user = result.scalar_one_or_none()
-        return bool(db_user and db_user.is_admin)
+    """Cheap admin check for middleware (root OR db flag).
+
+    Reads through :func:`utils.user_flags.load_user_flags`, which answers the
+    admin AND banned question with one query and caches the pair briefly — the
+    two middlewares below plus the admin guard would otherwise each pay for
+    their own round trip on every tap.
+    """
+    from utils.user_flags import load_user_flags
+
+    return (await load_user_flags(user_id))[0]
 
 
 async def _is_banned(user_id: int) -> bool:
-    """Return True if the user is banned in the database."""
-    async with async_session_factory() as session:
-        result = await session.execute(
-            select(User).where(User.telegram_id == user_id)
-        )
-        db_user = result.scalar_one_or_none()
-        return bool(db_user and db_user.is_banned)
+    """Return True if the user is banned in the database (cached, see above)."""
+    from utils.user_flags import load_user_flags
+
+    return (await load_user_flags(user_id))[1]
 
 
 #: Users who already received the one-time ban notice. In-memory on purpose:

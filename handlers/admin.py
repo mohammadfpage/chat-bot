@@ -92,6 +92,7 @@ from utils.economy import (
 )
 from utils.emojis import get_plain_emoji
 from utils.group_admin import bot_is_admin
+from utils.user_flags import forget_user_flags
 from utils.support import (
     STATUS_ANSWERED,
     STATUS_CLOSED,
@@ -478,6 +479,10 @@ async def msg_ban_user(message: Message, state: FSMContext) -> None:
         target.is_banned = True
         await session.commit()
 
+    # Invalidate the coalesced flag cache so the ban is enforced on this
+    # user's very next update instead of waiting out the cache TTL.
+    forget_user_flags(target_id)
+
     await message.answer(
         f"{get_plain_emoji('ban')} کاربر <code>{target_id}</code> بلاک شد.",
         parse_mode="HTML",
@@ -509,6 +514,8 @@ async def msg_unban_user(message: Message, state: FSMContext) -> None:
     from middleware.force_join import forget_ban_notice
 
     forget_ban_notice(target_id)
+    # And the cache must stop reporting "banned" for the user right away.
+    forget_user_flags(target_id)
 
     await message.answer(
         f"{get_plain_emoji('unban')} بلاک کاربر <code>{target_id}</code> برداشته شد.",
@@ -1105,6 +1112,8 @@ async def msg_promote(message: Message, state: FSMContext) -> None:
         target.is_admin = True
         await session.commit()
 
+    forget_user_flags(target_id)
+
     await message.answer(
         f"{get_plain_emoji('success')} کاربر <code>{target_id}</code> ادمین شد.",
         parse_mode="HTML",
@@ -1139,6 +1148,8 @@ async def msg_demote(message: Message, state: FSMContext) -> None:
         target = await session.merge(target)
         target.is_admin = False
         await session.commit()
+
+    forget_user_flags(target_id)
 
     await message.answer(
         f"{get_plain_emoji('success')} ادمین <code>{target_id}</code> برکنار شد.",
