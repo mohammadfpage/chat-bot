@@ -101,6 +101,59 @@ Because the context becomes the repository root, Docker reads the **root
 
 ---
 
+## Deploy from GitHub with Cloudflare Workers Builds
+
+[Workers Builds](https://developers.cloudflare.com/workers/ci-cd/builds/) (the
+Git integration) runs a **Build command** and a **Deploy command** from the
+Worker's **Root directory**. The Wrangler config and the Dockerfile live in
+THIS folder, so the build must be pointed at it — one of the two ways below.
+
+**Recommended — set the build root to this folder:**
+
+| Setting (Settings → Build) | Value |
+| --- | --- |
+| **Root directory** | `deploy/cloudflare` |
+| **Build command** | `npm ci` |
+| **Deploy command** | `npx wrangler deploy` |
+
+**Equivalent — keep the Root directory at the repo root and pass `--prefix`:**
+
+| Setting (Settings → Build) | Value |
+| --- | --- |
+| **Root directory** | *(empty = repository root)* |
+| **Build command** | `npm --prefix deploy/cloudflare ci` |
+| **Deploy command** | `npm --prefix deploy/cloudflare run deploy` |
+
+Why not plain `npx wrangler deploy` from the repo root? Because there is **no**
+Wrangler config there — it was moved into this folder on purpose so a Python
+host (Render, Railway, …) cannot auto-detect a Worker project and run Wrangler
+by mistake. With no config, Wrangler falls back to automatic project
+configuration and fails with exactly:
+
+```
+✘ [ERROR] Could not detect a directory containing static files (e.g. html, css and js) for the project
+```
+
+Notes:
+
+* **Never** use `pip install -r requirements.txt` or `python bot.py` as the
+  Build command. Python dependencies are installed **inside the Docker image**
+  (see `Dockerfile`) and `python bot.py` is the container's `CMD`, not a build
+  step.
+* Dockerfile builds **do** run in the Workers Builds environment — no Docker on
+  your machine is needed for a Git deploy (you only need it for `wrangler dev`).
+* Runtime **secrets** are set in **Settings → Variables & Secrets** (or
+  `npx wrangler secret put …`), never committed: `BOT_TOKEN`, `DATABASE_URL`,
+  `WEBHOOK_SECRET`, and optionally `REDIS_URL`, `PROXY_URL`.
+* Non-secret values (`ADMIN_IDS`, `WEBHOOK_BASE_URL`, `RUN_MODE`, …) live in
+  `wrangler.jsonc` → `vars`. A dashboard variable whose key also exists in
+  `vars` is overwritten by the config on every deploy, so edit
+  `WEBHOOK_BASE_URL` in the **file** (step 7 of the deploy checklist) and push.
+* The first build publishes the container image and rolls out the instance;
+  provisioning can take a few minutes.
+
+---
+
 ## Local dev (`wrangler dev`)
 
 1. Copy the template and fill in real values:

@@ -162,6 +162,25 @@ npm --prefix deploy/cloudflare run cf:check   # اعتبارسنجی offline (dr
 به ریشه نیست. `.dockerignore` ریشه جلوی ورود `.env`/`venv`/`*.db`/`node_modules`
 به image را می‌گیرد.
 
+### استقرار از GitHub با Workers Builds
+
+اگر Worker را از داشبورد کلادفلر به گیت‌هاب وصل کرده‌اید، در
+**Settings → Build** این مقادیر را بگذارید (کانفیگ عمداً در
+`deploy/cloudflare/` است و در ریشه وجود ندارد، پس `npx wrangler deploy`
+خالی از ریشه با خطای «Could not detect a directory containing static files»
+می‌افتد):
+
+| فیلد | مقدار |
+| --- | --- |
+| Root directory | `deploy/cloudflare` |
+| Build command | `npm ci` |
+| Deploy command | `npx wrangler deploy` |
+
+هرگز `pip install -r requirements.txt` یا `python bot.py` را در Build command
+نگذارید: وابستگی‌های پایتون **داخل image داکر** نصب می‌شوند و `python bot.py`
+`CMD` کانتینر است. جزئیات و حالت جایگزین (بدون تغییر Root directory) →
+[`deploy/cloudflare/README.md`](deploy/cloudflare/README.md).
+
 ### متغیرها و secret ها
 
 | کلید | محل |
