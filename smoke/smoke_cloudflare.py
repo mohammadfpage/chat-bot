@@ -252,11 +252,55 @@ async def _rebuild_main() -> None:
 asyncio.run(_rebuild_main())
 
 # ── 6. bot.py wiring ──
-check("empty REDIS_URL → MemoryStorage",
-      isinstance(bot_mod.build_fsm_storage(""), MemoryStorage))
+# REDIS_URL empty → the bot's own DATABASE (durable, no extra service);
+# REDIS_URL set → Redis, exactly as before. See bot.build_fsm_storage.
+_r = bot_mod.build_fsm_storage("")
+check("empty REDIS_URL → DatabaseStorage (state survives restarts)",
+      type(_r).__name__ == "DatabaseStorage", type(_r).__name__)
 _r = bot_mod.build_fsm_storage("redis://default:secret@127.0.0.1:6379/0")
 check("redis URL → RedisStorage", type(_r).__name__ == "RedisStorage",
       type(_r).__name__)
+check("Redis is still the path when REDIS_URL is set, not the database",
+      type(_r) is not MemoryStorage)
+
+
+async def _fsm_roundtrip() -> None:
+    """DatabaseStorage on a throwaway engine: full write/read/clear cycle."""
+    from database.fsm import DatabaseStorage
+    from database.models import Base
+    from sqlalchemy.ext.asyncio import (
+        async_sessionmaker,
+        create_async_engine,
+    )
+
+    eng = create_async_engine("sqlite+aiosqlite:///:memory:")
+    factory = async_sessionmaker(eng, expire_on_commit=False)
+    async with eng.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    st = DatabaseStorage(factory)
+    key = StorageKey(bot_id=111, chat_id=222, user_id=333, thread_id=None)
+    check("FSM DB: fresh key → state None", await st.get_state(key) is None)
+    check("FSM DB: fresh key → data {}", await st.get_data(key) == {})
+    await st.set_state(key, "Profile:age")
+    check("FSM DB: state round-trips", await st.get_state(key) == "Profile:age")
+    await st.set_data(key, {"age": "24", "city": "تهران"})
+    check("FSM DB: data round-trips",
+          await st.get_data(key) == {"age": "24", "city": "تهران"},
+          await st.get_data(key))
+    await st.update_data(key, {"height": "180"})
+    check("FSM DB: update merges", (await st.get_data(key))["height"] == "180")
+    # state.clear() writes state=None + data={} — the storage MUST honour it
+    await st.set_state(key, None)
+    check("FSM DB: set_state(None) clears state", await st.get_state(key) is None)
+    await st.set_data(key, {})
+    check("FSM DB: set_data({}) clears data", await st.get_data(key) == {})
+    # rows never leak across keys
+    other = StorageKey(bot_id=111, chat_id=223, user_id=334, thread_id=None)
+    check("FSM DB: other key untouched", await st.get_data(other) == {})
+    await eng.dispose()
+
+
+asyncio.run(_fsm_roundtrip())
 
 check("stop signal is a no-op without a loop", bot_mod._install_stop_signal() is None)
 

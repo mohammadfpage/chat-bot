@@ -824,3 +824,37 @@ class CoinTransaction(Base):
         return (
             f"<CoinTransaction {self.user_id} {self.amount:+g} {self.reason}>"
         )
+
+
+class FsmState(Base):
+    """One aiogram FSM key — the durable fallback when no Redis is configured.
+
+    The FSM storage (profile wizard steps, anonymous-chat queue position, …)
+    lives in Redis whenever ``REDIS_URL`` is set, and FALLS BACK TO THIS TABLE
+    otherwise. Previously the fallback was ``MemoryStorage``, which means a
+    Render sleep/restart wiped every half-finished wizard even when the
+    operator had deliberately chosen not to run Redis; storing the same
+    records in ``DATABASE_URL`` — PostgreSQL in production, SQLite locally —
+    keeps them through restarts and sleeps with no extra service to pay for.
+
+    One row per :class:`~aiogram.fsm.storage.base.StorageKey`. The key is a
+    text composite of all four aiogram key parts (bot/chat/user/thread), so
+    NULLable user ids never fight the PostgreSQL rule that PK columns are
+    NOT NULL, and the same schema round-trips on both dialects.
+    """
+
+    __tablename__ = "fsm_states"
+
+    storage_key: Mapped[str] = mapped_column(String(120), primary_key=True)
+    # ``None`` mirrors MemoryStorage: state and data are set independently.
+    state: Mapped[str | None] = mapped_column(Text, nullable=True)
+    data: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now(), index=True
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<FsmState {self.storage_key} state={self.state!r} "
+            f"keys={sorted((self.data or {}).keys())}>"
+        )

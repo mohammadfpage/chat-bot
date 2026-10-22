@@ -54,8 +54,8 @@ async def _probe_redis() -> None:
     print("── Redis / FSM storage ─────────────────────────────")
     url = (settings.redis_url or "").strip()
     if not url:
-        print("  REDIS_URL is empty → MemoryStorage (no remote cache; fine for")
-        print("  local dev, but production should set it so state survives a sleep).")
+        print("  REDIS_URL is empty → FSM stored in the DATABASE (durable across")
+        print("  restarts/sleeps — no extra Redis service needed).")
         return
 
     if url.startswith("redis://") and (urlsplit(url).hostname or "").endswith(

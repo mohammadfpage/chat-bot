@@ -8,6 +8,10 @@
 #   * a free web service sleeps after ~15 minutes of inactivity; while it is
 #     asleep Telegram's webhook deliveries bounce and are retried by Telegram.
 #     The bot rebuilds its state from PostgreSQL/Redis on the next wake.
+#   * REDIS_URL below is OPTIONAL: empty (default) keeps aiogram FSM state
+#     in the PostgreSQL DATABASE_URL — durable across restarts/sleeps with
+#     no extra service. Set a rediss:// URL only if you consciously want
+#     Redis (e.g. Upstash) to hold wizard/chat states instead.
 #   * the free plan has NO persistent disk, so production MUST use managed
 #     PostgreSQL (DATABASE_URL). Do not point DATABASE_URL at SQLite.
 #
@@ -53,6 +57,7 @@ services:
         sync: false
       - key: REDIS_URL
         sync: false
+      # (optional — leave unset to keep FSM state in the PostgreSQL above)
       - key: WEBHOOK_SECRET
         sync: false
       - key: WEBHOOK_BASE_URL

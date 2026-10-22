@@ -423,7 +423,9 @@ async def _spawn_keyboard_cleanup(bot: Bot) -> None:
 
 
 # ──────────────────────────────────────────────────────────────
-# FSM storage: MemoryStorage locally, Redis in the container
+# FSM storage: Redis when REDIS_URL is set, else the bot's own database.
+# Neither path loses state on restart/sleep; MemoryStorage now only appears
+# when even the database is unreachable. See build_fsm_storage.
 # ──────────────────────────────────────────────────────────────
 
 #: How long the startup PING waits for Redis before deciding the backend is
@@ -437,6 +439,37 @@ _FSM_PING_TIMEOUT = 5.0
 #: scheme and would skip the handshake entirely, so a plain-scheme Upstash URL
 #: is upgraded here rather than failing every FSM read.
 _TLS_ONLY_HOSTS = (".upstash.io",)
+
+
+def _fallback_fsm_backend(reason: str) -> BaseStorage:
+    """Best available durable backend: the database, else plain memory.
+
+    Called when Redis is configured but unusable (unparsable URL, failed
+    PING). The database backend keeps state across restarts exactly like the
+    bot's own tables — so a broken REDIS_URL degrades to a durable backend
+    instead of the old MemoryStorage, which lost state silently. If even the
+    database cannot be reached, the bot still RUNS (on MemoryStorage): being
+    up but amnesiac beats never booting at all, and the log line says loudly
+    which of the two it picked.
+    """
+    try:
+        from database.fsm import DatabaseStorage
+
+        storage = DatabaseStorage()
+        logger.error(
+            "%s — falling back to the DATABASE FSM storage (%s).",
+            reason,
+            settings.database_dialect,
+        )
+        return storage
+    except Exception as exc:  # noqa: BLE001 — the bot must boot regardless
+        logger.error(
+            "%s — the database fallback also failed (%s); using "
+            "MemoryStorage. FSM state will NOT survive a restart.",
+            reason,
+            exc,
+        )
+        return MemoryStorage()
 
 
 def _ensure_redis_tls(url: str) -> str:
@@ -455,17 +488,20 @@ def _ensure_redis_tls(url: str) -> str:
 def build_fsm_storage(redis_url: str | None = None) -> BaseStorage:
     """Pick the aiogram FSM backend from ``REDIS_URL``.
 
-    Local/default: ``MemoryStorage`` — state dies with the process, which is
-    exactly right for a laptop that is restarted on purpose.
+    Two rules, both durable:
 
-    Production (Render/Cloudflare): a Redis URL keeps FSM states across the
-    platform's stop/start cycles, so a user mid-profile-setup or mid-queue
-    does not lose their place when the container sleeps — **but only if the
-    URL actually connects**. ``RedisStorage.from_url`` merely *parses* the URL
-    and opens no connection, so this function alone cannot tell a working
-    Upstash endpoint from a typo; ``verify_fsm_storage`` pings it at startup
-    for that. A URL that cannot even be parsed degrades to MemoryStorage with
-    a loud log instead of an import/startup crash.
+    * ``REDIS_URL`` set → Redis. Keeps FSM states across the platform's
+      stop/start cycles **but only if the URL actually connects**;
+      ``RedisStorage.from_url`` merely *parses* the URL and opens no
+      connection, so ``verify_fsm_storage`` pings it at startup for that.
+      A URL that cannot even be parsed falls back to the DATABASE storage
+      with a loud log instead of an import/startup crash.
+    * ``REDIS_URL`` empty → the bot's OWN database (PostgreSQL in production,
+      SQLite locally) via ``database.fsm.DatabaseStorage``. Same durability
+      as Redis, one less paid service, and the connection is one the bot
+      already keeps open for every other query. Previously the fallback was
+      ``MemoryStorage`` — a Render sleep silently erased every half-finished
+      profile wizard, which is exactly what production must NOT do.
 
     Upstash (TLS) needs the **rediss://** scheme — with a plain ``redis://``
     the TLS handshake never happens and every state read fails. The endpoint
@@ -476,7 +512,14 @@ def build_fsm_storage(redis_url: str | None = None) -> BaseStorage:
     """
     url = (settings.redis_url if redis_url is None else redis_url or "").strip()
     if not url:
-        return MemoryStorage()
+        from database.fsm import DatabaseStorage
+
+        logger.info(
+            "REDIS_URL is empty — FSM state stored in the DATABASE (%s); "
+            "it survives restarts/sleeps without Redis.",
+            settings.database_dialect,
+        )
+        return DatabaseStorage()
     url = _ensure_redis_tls(url)
     try:
         from aiogram.fsm.storage.redis import RedisStorage
@@ -498,17 +541,15 @@ def build_fsm_storage(redis_url: str | None = None) -> BaseStorage:
             },
         )
     except Exception as exc:  # noqa: BLE001 — a bad REDIS_URL must not stop boot
-        logger.error(
-            "REDIS_URL is set but unusable (%s) — falling back to MemoryStorage. "
-            "FSM state will NOT survive a restart.", exc,
+        return _fallback_fsm_backend(
+            f"REDIS_URL is set but unusable ({exc})"
         )
-        return MemoryStorage()
     logger.info("FSM storage: Redis (%s)", _mask_proxy(url))
     return storage
 
 
 async def verify_fsm_storage(storage: BaseStorage) -> BaseStorage:
-    """Prove a Redis FSM backend is reachable, or fall back to memory.
+    """Prove a Redis FSM backend is reachable, or fall back to the database.
 
     ``build_fsm_storage`` cannot detect an *unreachable* Redis — parsing a URL
     succeeds even for a dead host. That gap is the whole profile-loss bug in
@@ -517,38 +558,33 @@ async def verify_fsm_storage(storage: BaseStorage) -> BaseStorage:
     answers and the user can never finish. A single bounded ``PING`` here,
     before any update is served, turns that into a loud startup error.
 
-    A failed ping falls back to MemoryStorage (the bot still runs) but logs at
-    ERROR, and the discarded Redis pool is closed so it cannot leak. A
-    MemoryStorage is returned untouched — there is nothing to reach.
+    A failed ping falls back to the DATABASE storage (the bot still runs and
+    state stays durable) but logs at ERROR, and the discarded Redis pool is
+    closed so it cannot leak. Storages with nothing to reach — DatabaseStorage
+    included, whose health is reported by ``init_db`` at boot already — are
+    returned untouched.
     """
     redis = getattr(storage, "redis", None)
     if redis is None:
-        return storage  # MemoryStorage: no connection to verify
+        return storage  # DatabaseStorage / MemoryStorage: nothing to verify
 
     try:
         pong = await asyncio.wait_for(redis.ping(), timeout=_FSM_PING_TIMEOUT)
     except Exception as exc:  # noqa: BLE001 — never let a bad Redis stop boot
-        logger.error(
-            "REDIS_URL is set but the server did not answer PING (%s: %s) — "
-            "falling back to MemoryStorage. FSM state (a half-finished "
-            "profile, a chat queue) will NOT survive a restart. Check the "
-            "Upstash URL: it must be rediss://… (TLS) with the right password.",
-            type(exc).__name__,
-            exc,
-        )
         with suppress(Exception):
             await storage.close()
-        return MemoryStorage()
+        return _fallback_fsm_backend(
+            f"REDIS_URL is set but the server did not answer PING ({exc!r}). "
+            "Check the Upstash URL: it must be rediss://… (TLS) with the "
+            "right password"
+        )
 
     if not pong:
-        logger.error(
-            "REDIS accepted the connection but PING returned a false value — "
-            "falling back to MemoryStorage; FSM state will NOT survive a "
-            "restart."
-        )
         with suppress(Exception):
             await storage.close()
-        return MemoryStorage()
+        return _fallback_fsm_backend(
+            "REDIS accepted the connection but PING returned a false value"
+        )
 
     logger.info("FSM storage ping OK — Redis reachable; state will persist.")
     return storage
@@ -602,12 +638,13 @@ def _install_stop_signal() -> None:
 async def build_bot_and_dispatcher() -> tuple[Bot, Dispatcher]:
     """Create the Bot and Dispatcher, register routers + middleware."""
     # ── FSM storage ──
-    # MemoryStorage by default (local polling); RedisStorage when REDIS_URL
-    # is set, which is what keeps a user's place in a wizard across host
-    # restarts/sleeps (Render, Cloudflare, …). See build_fsm_storage.
-    # verify_fsm_storage pings it once so a misconfigured/unreachable Upstash
-    # is caught here, before any update is served, instead of on the first
-    # profile step the user takes.
+    # RedisStorage when REDIS_URL is set; otherwise the bot's OWN database
+    # (PostgreSQL in production, SQLite locally) via DatabaseStorage — which
+    # is what keeps a user's place in a wizard across host restarts/sleeps
+    # (Render, Cloudflare, …) whether or not Redis is configured. See
+    # build_fsm_storage. verify_fsm_storage pings Redis once so a
+    # misconfigured/unreachable Upstash is caught here, before any update is
+    # served, instead of on the first profile step the user takes.
     storage = build_fsm_storage(settings.redis_url)
     storage = await verify_fsm_storage(storage)
     # Wrap only AFTER the startup PING has decided the backend is usable: the

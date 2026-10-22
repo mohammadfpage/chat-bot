@@ -2,7 +2,8 @@
 # asyncpg + redis are required by PRODUCTION (the Render web service, and the
 # optional Cloudflare Containers path):
 #   asyncpg — DATABASE_URL=postgresql+asyncpg://… (see config.py)
-#   redis   — REDIS_URL=… for the aiogram FSM storage (bot.py build_fsm_storage)
+#   redis   — only needed when REDIS_URL is set (optional FSM cache; when it
+#             is empty the FSM state lives in the DATABASE instead)
 # Local SQLite/MemoryStorage runs import neither at startup, so adding them
 # here costs nothing on a laptop and makes `pip install -r` sufficient for
 # every environment.

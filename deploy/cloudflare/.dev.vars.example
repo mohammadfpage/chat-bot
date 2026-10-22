@@ -38,7 +38,8 @@ WEBHOOK_BASE_URL=
 WEBHOOK_SECRET=REPLACE_WITH_A_LONG_RANDOM_STRING
 
 # OPTIONAL — managed Redis keeps FSM wizard state across container sleeps.
-# Leave empty to use in-process MemoryStorage (state lost on a cold start).
+# Leave empty to store FSM state in DATABASE_URL instead (also durable —
+# PostgreSQL in production; SQLite in the local .dev.vars run).
 # REDIS_URL=redis://default:password@host:6379/0
 
 # OPTIONAL — reach api.telegram.org through a proxy (socks5://, socks4://,

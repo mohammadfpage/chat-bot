@@ -211,17 +211,19 @@ class Settings(BaseSettings):
     database_url: str = "sqlite+aiosqlite:///database.db"
 
     # ── FSM storage (used only by bot.py) ──
-    # Empty = aiogram MemoryStorage (state dies with the process — fine for
-    # local polling, but it also means a Render/Cloudflare sleep WIPES any
-    # half-finished profile wizard, which is why production MUST set this).
-    # Set to a Redis URL to keep FSM states across restarts/sleeps:
+    # OPTIONAL. Empty (the default) = FSM state is kept in the project's OWN
+    # database (DATABASE_URL — PostgreSQL in production, SQLite locally), so
+    # a restart or a Render sleep does NOT lose a half-finished wizard and
+    # no Redis service is needed at all.
+    # Set it to a Redis URL to use Redis instead:
     #   Upstash (TLS REQUIRED):  REDIS_URL=rediss://default:<password>@<region>.upstash.io:<port>
     #   plain Redis:             REDIS_URL=redis://default:<password>@<host>:6379/0
     # NB: Upstash only speaks TLS — a plain redis:// URL fails the handshake
     # and every state read dies, so use the rediss:// endpoint it gives you.
     # Read by build_fsm_storage() and pinged once by verify_fsm_storage();
-    # an unreachable/broken URL falls back to MemoryStorage with a logged
-    # ERROR instead of failing startup.
+    # an unreachable/broken URL falls back to the DATABASE storage with a
+    # logged ERROR instead of failing startup (MemoryStorage only if the
+    # database itself is unreachable too).
     redis_url: str = ""
 
     # ── Cloudflare ──

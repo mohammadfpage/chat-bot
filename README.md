@@ -69,7 +69,7 @@ Render فقط `requirements.txt` را نصب می‌کند و خودِ `bot.py` 
 | --- | --- |
 | `BOT_TOKEN` | از @BotFather |
 | `DATABASE_URL` | PostgreSQL مدیریت‌شده — `postgresql+asyncpg://user:pass@host:5432/db` (فرم `postgres://` هم خودکار اصلاح می‌شود) |
-| `REDIS_URL` | اختیاری ولی توصیه‌شده: `rediss://user:pass@host:6379` تا وضعیت FSM از خواب/ری‌استارت جان سالم به در ببرد |
+| `REDIS_URL` | اختیاری: خالی بماند تا وضعیت FSM در همان PostgreSQL ذخیره شود (پیش‌فرض، ماندگار و بدون سرویس اضافی)؛ اگر Redis جداگانه می‌خواهید `rediss://user:pass@host:6379` بدهید |
 | `WEBHOOK_SECRET` | فقط `A-Za-z0-9_-`؛ خالی = در هر بوت یکی تصادفی ساخته می‌شود |
 | `WEBHOOK_BASE_URL` | بعد از اولین deploy: `https://<service>.onrender.com` (بدون اسلش انتهایی) |
 | `ADMIN_IDS` | آیدی‌های عددی ادمین، جدا با کاما |
@@ -119,7 +119,7 @@ Render فقط `requirements.txt` را نصب می‌کند و خودِ `bot.py` 
 | ربات بالا نمی‌آید / crash loop | `BOT_TOKEN` یا `DATABASE_URL` ست نشده، یا `WEBHOOK_BASE_URL` خالی است |
 | `404` روی وبهوک | `WEBHOOK_BASE_URL` با آدرس سرویس یکی نیست، یا `WEBHOOK_PATH` عوض شده |
 | داده بعد از مدتی ریست می‌شود | `DATABASE_URL` روی SQLite است (پلن رایگان دیسک ندارد) |
-| وضعیت کاربران بعد از خواب ریست شد | `REDIS_URL` خالی/خراب است یا rebuild در لاگ خطا داده |
+| وضعیت کاربران بعد از خواب ریست شد | وضعیت FSM در دیتابیس ذخیره می‌شود و خواب/ری‌استارت دیگر آن را پاک نمی‌کند؛ اگر باز هم ریست شد، rebuild در لاگ خطا داده را بررسی کنید (و اگر `REDIS_URL` دارید، پیام خطای PING را) |
 | پنل ادمین نیست | `ADMIN_IDS` خالی است |
 
 ---
@@ -216,5 +216,5 @@ python deploy/cloudflare/set_webhook.py --remove        # بازگشت به poll
 خلاصهٔ معماری: کانتینر `python:3.12` کل ربات را اجرا می‌کند (بدون VPS)،
 `worker/index.js` فقط `POST WEBHOOK_PATH` و `GET /health` را به آن forward
 می‌کند، و `max_instances` باید ۱ بماند (حالت matching در حافظهٔ فرایند است).
-دیسک کانتینر موقتی است، پس دیتابیس همان PostgreSQL و FSM همان Redis است.
+دیسک کانتینر موقتی است، پس دیتابیس همان PostgreSQL است و وضعیتِ FSM هم بدون `REDIS_URL` در همان PostgreSQL ذخیره می‌شود (با `REDIS_URL` در Redis).
 جزئیات و چک‌لیست → [`deploy/cloudflare/README.md`](deploy/cloudflare/README.md).
