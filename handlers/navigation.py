@@ -92,8 +92,14 @@ async def _to_main_menu(message: Message, state: FSMContext, note: str) -> None:
 
         await leave_search_queue(message.from_user.id)
 
-    await state.clear()
+    # Reset straight to ``idle`` with empty data in ONE storage write instead
+    # of ``clear()`` + ``set_state(idle)``: on the DB-backed FSM each storage
+    # call is a separate round trip (~200-340 ms on Neon), and ``clear()``
+    # writes state and data separately — three round trips for a no-op reset.
+    # The storage also skips a write whose value it already knows, so a repeat
+    # menu tap costs zero statements.
     await state.set_state(ChatState.idle)
+    await state.set_data({})
     await message.answer(note, reply_markup=main_menu_kb())
 
 
@@ -113,7 +119,12 @@ async def nav_start(message: Message, state: FSMContext) -> None:
     from handlers.chat import leave_search_queue
 
     await leave_search_queue(message.from_user.id)
-    await state.clear()
+    # ``cmd_start`` sets ``idle`` on every path that reaches its end, and the
+    # app treats ``None`` and ``idle`` identically (see ``chat._FREE_STATES``),
+    # so reset BEFORE it: a warm /start then does no FSM write at all instead
+    # of ``clear()``'s two plus ``idle``.
+    await state.set_state(ChatState.idle)
+    await state.set_data({})
     await cmd_start(message, state)
 
 
@@ -140,8 +151,9 @@ async def nav_menu(message: Message, state: FSMContext) -> None:
 
     if await _blocked_by_live_session(message, await state.get_state()):
         return
-    await state.clear()
+    # Same one-write reset as ``_to_main_menu`` (see the comment there).
     await state.set_state(ChatState.idle)
+    await state.set_data({})
     await message.answer("منوی اصلی:", reply_markup=main_menu_kb())
 
 

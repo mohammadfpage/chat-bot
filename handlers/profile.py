@@ -55,6 +55,7 @@ GENDER_BY_LABEL = {
     GENDER_FEMALE_LABEL: "female",
 }
 from utils.helpers import format_user_profile
+from utils.user_flags import forget_user_flags
 
 router = Router()
 
@@ -393,6 +394,11 @@ async def confirm_profile(message: Message, state: FSMContext) -> None:
         return
 
     logger.info("Profile completed for telegram_id=%s", message.from_user.id)
+
+    # The flags cache holds ``is_profile_complete`` for a few seconds; without
+    # this the very next tap of «👤 پروفایل من» could be filtered out by the
+    # still-stale ``False`` and the button would look dead.
+    forget_user_flags(message.from_user.id)
 
     # ── Final question: show profile photo or not (separate step, not nested) ──
     await state.set_state(ProfileSetup.waiting_for_photo_choice)

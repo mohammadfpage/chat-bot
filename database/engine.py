@@ -168,6 +168,35 @@ async_session_factory = async_sessionmaker(
 )
 
 
+def _create_missing_tables(sync_conn) -> None:
+    """Create only the mapped tables that do not exist yet — in one probe.
+
+    A bare ``Base.metadata.create_all`` defaults to ``checkfirst=True``, which
+    issues a per-table existence probe (an information_schema query on
+    PostgreSQL) for EVERY mapped table. This schema — 17+ tables — turned
+    that into 17+ SEQUENTIAL round trips before the bot could even finish
+    booting; on the measured Neon RTT (~200-340 ms per query, see the
+    Render ``slow DB query`` startup logs) that is 4-6 s of pure
+    existence-checking on every deploy/restart, all of it showing up as
+    "slow DB query" lines about schema inspection.
+
+    One ``get_table_names`` reflection answers "what already exists" in one
+    or two round trips, and ``checkfirst=False`` then CREATEs only the
+    missing tables with zero extra probes. Idempotent, order-preserving
+    (``sorted_tables`` keeps FK dependencies first), and dialect-agnostic.
+    """
+    existing = set(sa_inspect(sync_conn).get_table_names())
+    missing = [
+        table
+        for table in Base.metadata.sorted_tables
+        if table.name not in existing
+    ]
+    if missing:
+        Base.metadata.create_all(
+            sync_conn, tables=missing, checkfirst=False
+        )
+
+
 async def init_db() -> None:
     """Create all tables on startup.
 
@@ -176,7 +205,9 @@ async def init_db() -> None:
     drops the ones the current schema no longer has.
     """
     async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+        # One reflection instead of a per-table has_table round trip — see
+        # _create_missing_tables for the measured startup cost this removes.
+        await conn.run_sync(_create_missing_tables)
 
         # ── Lightweight migration (SQLite) ──
         dialect = engine.dialect.name

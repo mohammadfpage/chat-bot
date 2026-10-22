@@ -267,11 +267,13 @@ check("Redis is still the path when REDIS_URL is set, not the database",
 async def _fsm_roundtrip() -> None:
     """DatabaseStorage on a throwaway engine: full write/read/clear cycle."""
     from database.fsm import DatabaseStorage
-    from database.models import Base
+    from database.models import Base, FsmState
     from sqlalchemy.ext.asyncio import (
         async_sessionmaker,
         create_async_engine,
     )
+
+    import database.fsm as fsm_mod
 
     eng = create_async_engine("sqlite+aiosqlite:///:memory:")
     factory = async_sessionmaker(eng, expire_on_commit=False)
@@ -297,6 +299,30 @@ async def _fsm_roundtrip() -> None:
     # rows never leak across keys
     other = StorageKey(bot_id=111, chat_id=223, user_id=334, thread_id=None)
     check("FSM DB: other key untouched", await st.get_data(other) == {})
+
+    # A persisted row written by the DEPLOYED version must still be found: the
+    # key encoding is data compatibility, not a free choice.
+    legacy = StorageKey(bot_id=9, chat_id=9, user_id=9, thread_id=None)
+    legacy_sk = f"{legacy.bot_id}:{legacy.chat_id}:{legacy.user_id}:{legacy.thread_id}"
+    check("FSM DB: key encoding is the deployed one",
+          fsm_mod._storage_key(legacy) == legacy_sk, fsm_mod._storage_key(legacy))
+    async with factory() as s:
+        s.add(FsmState(storage_key=legacy_sk, state="ProfileSetup:age",
+                       data={"a": "1"}))
+        await s.commit()
+    fsm_mod._cache.clear()
+    check("FSM DB: old row is readable",
+          await st.get_state(legacy) == "ProfileSetup:age")
+    # A write to ONE column must never hide the OTHER column that the database
+    # already holds (a cold-cache data write used to default state to None).
+    fsm_mod._cache.clear()
+    await st.set_data(legacy, {"b": "2"})
+    check("FSM DB: cold set_data keeps persisted state",
+          await st.get_state(legacy) == "ProfileSetup:age")
+    fsm_mod._cache.clear()
+    await st.set_state(legacy, "ChatState:in_chat")
+    check("FSM DB: cold set_state keeps persisted data",
+          await st.get_data(legacy) == {"b": "2"})
     await eng.dispose()
 
 

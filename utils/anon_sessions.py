@@ -49,6 +49,7 @@ time at all.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timedelta
 from uuid import uuid4
 
@@ -79,6 +80,24 @@ SESSION_MAX_LIFETIME_HOURS = 24
 #: Safe status values accepted by :func:`close`. Kept as a set so a typo in a
 #: call site can never write a nonsense status into the table.
 _ENDABLE = frozenset({STATUS_PENDING, STATUS_ACTIVE})
+
+#: How long "this user has NO active session" may be trusted. Only the
+#: NEGATIVE answer is cached — a live row is re-read on every message because
+#: its status must stay exact and it is the rare case. The win is the common
+#: case: ``relay_to_partner`` is a bare catch-all that sees EVERY private
+#: message, so before this it spent one Neon round trip (~200-340 ms) before
+#: any handler could even run, for users who are not in an anon chat at all.
+#: Short TTL because :func:`activate` also invalidates both sides eagerly; the
+#: TTL only bounds a race between two processes (the project runs one).
+_NO_SESSION_TTL = 5.0
+_no_session_until: dict[int, float] = {}
+
+
+def _forget_no_session(*user_ids: int | None) -> None:
+    """Drop the negative cache of these users after a session state change."""
+    for user_id in user_ids:
+        if user_id:
+            _no_session_until.pop(int(user_id), None)
 
 
 def _either(user_id: int) -> or_:
@@ -147,8 +166,13 @@ async def active_session(user_id: int) -> AnonChatSession | None:
 
     One query answers every question the relay needs — is there a session and who is
     the other side — so the handler does not have to go back to the database a
-    second time per message.
+    second time per message. A "no session" answer is cached for
+    :data:`_NO_SESSION_TTL` seconds; a live row is always re-read.
     """
+    now = time.monotonic()
+    if _no_session_until.get(user_id, 0.0) > now:
+        return None
+
     try:
         async with async_session_factory() as session:
             result = await session.execute(
@@ -168,6 +192,7 @@ async def active_session(user_id: int) -> AnonChatSession | None:
         return None
 
     if row is None or _is_stale(row):
+        _no_session_until[user_id] = now + _NO_SESSION_TTL
         return None
     return row
 
@@ -314,6 +339,8 @@ async def activate(row: AnonChatSession) -> bool:
         if current is None or current.status != STATUS_PENDING:
             return False
 
+        requester, partner = current.requester_id, current.partner_id
+
         clash = await session.scalar(
             select(AnonChatSession)
             .where(
@@ -331,6 +358,7 @@ async def activate(row: AnonChatSession) -> bool:
                 row.id,
                 clash.id,
             )
+            _forget_no_session(requester, partner)
             return False
 
         current.status = STATUS_ACTIVE
@@ -339,6 +367,9 @@ async def activate(row: AnonChatSession) -> bool:
         await session.commit()
         row.status = STATUS_ACTIVE
         row.activated_at = current.activated_at
+    # Both sides are now live: a cached "no session" for either would swallow
+    # their next message instead of relaying it.
+    _forget_no_session(requester, partner)
     return True
 
 
@@ -361,6 +392,7 @@ async def close(row: AnonChatSession, status: str) -> bool:
         current.ended_at = datetime.utcnow()
         await session.commit()
     row.status = status
+    _forget_no_session(row.requester_id, row.partner_id)
     return True
 
 
@@ -382,6 +414,7 @@ async def end_for_user(user_id: int) -> int | None:
         row.status = STATUS_ENDED
         row.ended_at = datetime.utcnow()
         await session.commit()
+    _forget_no_session(user_id, other)
     logger.info("Anon chat ended by %s (partner %s)", user_id, other)
     return other
 
