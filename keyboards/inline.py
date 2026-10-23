@@ -347,9 +347,16 @@ def get_whisper_action_keyboard(
     deliberate trade: four live-looking buttons in front of a whole group on an
     unclaimed card are worse than none.
 
-    Layout:
-        [📊 آمار]  [👁️ نمایش پیام]  [🗑️ حذف]
-        [⚙️ گزینه‌ها]  [↩️ پاسخ]
+    Layout — only the actions the card exists for, nothing informational:
+        [👁️ نمایش پیام]  [↩️ پاسخ]
+        [🗑️ حذف]
+
+    «📊 آمار» and «⚙️ گزینه‌ها» used to sit here too. Both were *alerts* that
+    explained the card rather than actions on it, and they made a five-button
+    wall under a message whose whole point is that only two people care about
+    it. Their handlers (and the callback prefixes) stay in place because cards
+    already published carry the old frozen markup — removing the drawing must
+    not turn those taps into dead buttons — but no new card offers them.
 
     **Who may press what is decided in the handler, not here.** A card is one
     message rendered for everybody at once and Telegram freezes its markup the
@@ -381,26 +388,9 @@ def get_whisper_action_keyboard(
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(
-            text=f"{ICON_STATS} آمار",
-            callback_data=f"{WHISPER_STATS_CB_PREFIX}{whisper_id}",
-            style="primary",
-        ),
-        InlineKeyboardButton(
             text=f"{ICON_SHOW} نمایش پیام",
             callback_data=f"read_whisper:{whisper_id}",
             style="success",
-        ),
-        InlineKeyboardButton(
-            text=f"{ICON_DELETE} حذف",
-            callback_data=f"{WHISPER_DELETE_CB_PREFIX}{whisper_id}",
-            style="danger",
-        ),
-    )
-    builder.row(
-        InlineKeyboardButton(
-            text=f"{ICON_OPTIONS} گزینه‌ها",
-            callback_data=f"{WHISPER_OPTIONS_CB_PREFIX}{whisper_id}",
-            style="primary",
         ),
         InlineKeyboardButton(
             text=f"{ICON_REPLY} پاسخ",
@@ -418,6 +408,13 @@ def get_whisper_action_keyboard(
             # group the whisper was read in.
             switch_inline_query_current_chat=f"{WHISPER_REPLY_QUERY_PREFIX}{whisper_id} ",
             style="success",
+        ),
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text=f"{ICON_DELETE} حذف",
+            callback_data=f"{WHISPER_DELETE_CB_PREFIX}{whisper_id}",
+            style="danger",
         ),
     )
     return builder.as_markup()
@@ -480,7 +477,6 @@ def whisper_viewed_kb() -> InlineKeyboardMarkup:
         InlineKeyboardButton(
             text=f"{get_plain_emoji('verified')} خوانده شد",
             callback_data="whisper:noop",
-            style="primary",
             disabled=DisabledButton(),
         ),
     )
@@ -534,7 +530,6 @@ def whisper_help_kb() -> InlineKeyboardMarkup:
         InlineKeyboardButton(
             text=f"{ICON_GUIDE} راهنمای نجوا",
             callback_data="whisper:help",
-            style="primary",
         ),
     )
     builder.row(

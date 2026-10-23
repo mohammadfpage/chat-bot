@@ -1,18 +1,36 @@
-﻿"""
-On-startup group keyboard cleanup.
+"""
+Group keyboard cleanup helpers.
 
-Why this exists
----------------
+The startup sweep is GONE — this module no longer runs by itself
+------------------------------------------------------------------
+There used to be a hook on ``dp.startup`` that walked every group the bot knew
+and posted one (then deleted) message per chat on EVERY start. That reads as
+"the bot posts test messages into all groups when it is run", and it was the
+first thing users saw of a deploy — so starting the bot is now silent in
+groups, with no exceptions and no switch that can turn it back on.
+
+What remains, deliberately:
+
+* :func:`clear_group_keyboard_once` — the opt-in, first-sight clear (it still
+  honours ``GROUP_KEYBOARD_CLEANUP``, which defaults to off), so a one-off
+  repair of a group carrying an old keyboard never needs a broadcast.
+* :func:`known_chat_ids` / :func:`rewrite_chat_id` — the id bookkeeping the
+  roster sync and the migration path both read.
+* :func:`cleanup_group_keyboards` — the sweep itself, kept as a *manual* tool
+  for that one-off repair (nobody calls it at startup any more). It is not
+  registered anywhere; call it directly only when a group really does carry a
+  stuck keyboard that the first-sight path cannot see.
+
+Why Telegram needs a message at all
+-----------------------------------
 Telegram clients cache the last reply keyboard **per chat**. Removing the bot,
 being kicked and re-added, clearing the app cache — none of it flushes that
 cache. The only thing that clears it is a *new message from the bot carrying
 ``ReplyKeyboardRemove``*, so a group that was ever sent a
 ``ReplyKeyboardMarkup`` by an older build keeps the keyboard stuck at the bottom
-for every member until someone explicitly repairs it.
-
-So on every start we re-send the removal to each group the bot has ever posted
-in. Combined with :mod:`middleware.keyboard_guard` — which makes it impossible
-to put the keyboard *back* — this is the "permanent removal" half of the fix.
+for every member until someone explicitly repairs it. Combined with
+:mod:`middleware.keyboard_guard` — which makes it impossible to put the
+keyboard *back* — a single clear is enough for good.
 
 Why send-then-delete
 --------------------
@@ -24,10 +42,10 @@ so the delay before deleting must be long enough for slow mobile clients to
 have handled it. Deleting first would leave the cache dirty again.
 
 Chat ids come from the ``whispers`` table (``chat_id`` is recorded on every
-whisper card), cross-checked against ``whisper_config.required_chat_id``. Each
-id is verified with ``get_chat`` before being messaged: a row can outlive the
-bot's membership of the group, and a broadcast to an id the bot no longer
-belongs to just produces an error per group on every restart.
+whisper card), the ``group_chats`` registry and ``whisper_config.required_chat_id``.
+Each id is verified with ``get_chat`` before being messaged: a row can outlive
+the bot's membership of the group, and a broadcast to an id the bot no longer
+belongs to just produces an error per group on every run.
 """
 
 from __future__ import annotations
@@ -280,13 +298,16 @@ async def _clear_one(bot: Bot, chat: Chat) -> bool:
 
 
 async def cleanup_group_keyboards(bot: Bot) -> None:
-    """Startup hook: force-clear the cached reply keyboard in every group.
+    """Manual sweep: force-clear the cached reply keyboard in every group.
 
-    Registered on ``dp.startup``, so aiogram injects ``bot`` automatically.
+    **Not registered anywhere any more.** Starting the bot must be silent in
+groups, so this is no longer a startup hook — it is the one-off repair tool
+left behind for the rare group that still shows a keyboard from an older
+build (the first-sight path only covers groups the bot hears from afterwards).
 
-    Every failure path is swallowed on purpose. A cleanup that raises would
-    abort ``start_polling`` and take the whole bot offline over a cosmetic UI
-    bug in someone else's group, so this routine reports and moves on.
+    Every failure path is swallowed on purpose: a cleanup that raises would
+abort its caller over a cosmetic UI bug in someone else's group, so this
+routine reports and moves on.
     """
     if not settings.group_cleanup_enabled:
         logger.info("Keyboard cleanup: disabled via config.")
@@ -355,13 +376,13 @@ async def clear_group_keyboard_once(
 ) -> None:
     """Remember ``chat_id`` and clear its cached reply keyboard — once.
 
-    This is the "I just added the bot to a group" path. The startup sweep
-    only knows groups already stored in the database; a group the bot has
-    never seen before is invisible to it, so a keyboard left behind by an
-    older build would stay stuck there for every member until someone
-    happened to restart *after* the first whisper was posted. Triggering a
-    clear on the first update from a group closes that gap immediately,
-    without a restart and without waiting for a whisper.
+    This is the "I just added the bot to a group" path: the manual sweep above
+    only knows groups already stored in the database, and a group the bot has
+    never seen before is invisible to it, so a keyboard left behind by an older
+    build would stay stuck there for every member. Triggering a clear on the
+    first update from a group closes that gap immediately, without a restart,
+    without a sweep and without ever posting into a group the bot has not just
+    heard from.
 
     Everything is fire-and-forget-safe: the caller spawns this as a task, so
     a slow send or the cleanup delay never holds up the update being handled.

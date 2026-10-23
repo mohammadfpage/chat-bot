@@ -115,7 +115,7 @@ from keyboards import (  # noqa: E402
 
 panel = cbs(admin_panel_kb(is_root=False))
 check("panel exposes admin:support", "admin:support" in panel)
-check("panel is 11 buttons (support added)", len(panel) == 11, panel)
+check("panel is 12 buttons (support + user-panel exit)", len(panel) == 12, panel)
 
 ask = admin_support_kb(open_count=3, answered_count=2, total=5)
 check("inbox has three filters",

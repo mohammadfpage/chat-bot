@@ -105,11 +105,15 @@ class Settings(BaseSettings):
     # does not flush it — only a fresh ReplyKeyboardRemove does. These two
     # switches control the startup sweep that pushes that removal into every
     # group the bot has ever posted a whisper card in.
-    #   group_keyboard_cleanup:  set to "false" to skip the sweep entirely
+    #   group_keyboard_cleanup:  OFF by default. The sweep posts one (then
+    #                           deleted) message per known group on EVERY
+    #                           start, which reads as spam to members. Turn it
+    #                           on only for a one-off repair; the session-level
+    #                           keyboard guard already prevents new keyboards.
     #   group_keyboard_cleanup_delay: seconds to wait before deleting the
     #                           invisible cleanup message (give clients time
     #                           to apply the removal before it vanishes)
-    group_keyboard_cleanup: str = "true"
+    group_keyboard_cleanup: str = "false"
     group_keyboard_cleanup_delay: float = 2.0
 
     # ── Database ──

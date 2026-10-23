@@ -15,7 +15,7 @@ from aiogram import Bot, Router, F
 from aiogram.enums import ChatType
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
@@ -29,7 +29,6 @@ from handlers.inline_anon import (
 )
 from keyboards import (
     main_menu_kb,
-    admin_dual_panel_kb,
     admin_panel_kb,
     INLINE_HELP_LABEL,
     whisper_join_kb,
@@ -201,11 +200,31 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 
     # ── Admin dual-panel ──
     if int(user_id) in settings.admin_ids_list:
-        await message.answer(
-            f"سلام {escape(message.from_user.first_name or 'کاربر')}.\n"
+        # NO reply keyboard under the admin panel — a panel is an inline
+        # screen, and the user menu below it only ever invites a tap that
+        # lands the admin somewhere else. The way back to the user side is a
+        # row of the panel itself («👤 پنل کاربری»), which reinstalls the
+        # user keyboard on the way out.
+        sent = await message.answer(
+            f"سلام {escape(message.from_user.first_name or 'کاربر')}.\n\n"
+            "👑 <b>پنل مدیریت</b>\n"
             "از پنل زیر انتخاب کنید:",
-            reply_markup=admin_dual_panel_kb(),
+            parse_mode="HTML",
+            reply_markup=ReplyKeyboardRemove(),
         )
+        try:
+            await sent.edit_reply_markup(
+                reply_markup=admin_panel_kb(
+                    is_root=int(user_id) in settings.admin_ids_list
+                )
+            )
+        except Exception:
+            await message.answer(
+                "از منوی زیر انتخاب کنید:",
+                reply_markup=admin_panel_kb(
+                    is_root=int(user_id) in settings.admin_ids_list
+                ),
+            )
         return
 
     # ── Regular user ──
@@ -373,13 +392,24 @@ async def _handle_referral(
 # ──────────────────────────────────────────────────
 
 async def _finish_start(message: Message, state: FSMContext, *, is_admin: bool) -> None:
-    """Route to admin dual-panel or the regular user main menu."""
+    """Route to admin panel or the regular user main menu."""
     if is_admin:
-        await message.answer(
+        # Same rule as ``cmd_start``: the panel is inline, so it arrives with
+        # no reply keyboard at all rather than with the user menu underneath.
+        sent = await message.answer(
             f"سلام {escape(message.from_user.first_name or 'کاربر')}.\n\n"
+            "👑 <b>پنل مدیریت</b>\n"
             "از پنل زیر انتخاب کنید:",
-            reply_markup=admin_dual_panel_kb(),
+            parse_mode="HTML",
+            reply_markup=ReplyKeyboardRemove(),
         )
+        try:
+            await sent.edit_reply_markup(reply_markup=admin_panel_kb(is_root=True))
+        except Exception:
+            await message.answer(
+                "از منوی زیر انتخاب کنید:",
+                reply_markup=admin_panel_kb(is_root=True),
+            )
         return
 
     policy = await get_policy()
@@ -446,17 +476,50 @@ async def _handle_deep_link(
 
 @router.message(F.text == "👑 پنل مدیریت", F.chat.type == ChatType.PRIVATE)
 async def cb_admin_panel_entry(message: Message) -> None:
-    """Show admin panel when admin clicks '👑 پنل مدیریت'."""
+    """Show admin panel when admin clicks '👑 پنل مدیریت'.
+
+    The FIRST thing this does is take the reply keyboard away: an admin who
+    arrives here from the user side is still sitting on the user menu, and
+    every button of it is a tap away from the screen they asked for. A
+    ``ReplyKeyboardRemove`` travels on one plain message, which is then
+    re-keyed to the inline panel — the panel is the whole screen afterwards.
+    """
     if int(message.from_user.id) not in settings.admin_ids_list:
         return
     is_root = int(message.from_user.id) in settings.admin_ids_list
-    await message.answer(
+    sent = await message.answer(
         "👑 <b>پنل مدیریت</b>\n\n"
         "خوش آمدید. از منوی زیر انتخاب کنید:"
         + ("\n\n⭐ شما ریشه‌ادمین هستید." if is_root else ""),
         parse_mode="HTML",
-        reply_markup=admin_panel_kb(is_root=is_root),
+        reply_markup=ReplyKeyboardRemove(),
     )
+    try:
+        await sent.edit_reply_markup(reply_markup=admin_panel_kb(is_root=is_root))
+    except Exception:
+        await message.answer(
+            "از منوی زیر انتخاب کنید:",
+            reply_markup=admin_panel_kb(is_root=is_root),
+        )
+
+
+@router.callback_query(F.data == "admin:panel:user")
+async def cb_admin_to_user_panel(callback: CallbackQuery, state: FSMContext) -> None:
+    """The panel's own way back to the user side (inline «👤 پنل کاربری»).
+
+    A reply keyboard can only be installed by *sending* a message — an edit
+    never changes it — so this is the one panel exit that answers with a new
+    message rather than an edit. One message, one keyboard swap, and the FSM
+    drops back to ``idle`` so a half-finished admin input cannot swallow the
+    next menu tap.
+    """
+    await state.set_state(ChatState.idle)
+    await state.set_data({})
+    try:
+        await callback.answer()
+    except Exception:
+        pass
+    await callback.message.answer("منوی اصلی:", reply_markup=main_menu_kb())
 
 
 @router.message(F.text == "👤 پنل کاربری", F.chat.type == ChatType.PRIVATE)

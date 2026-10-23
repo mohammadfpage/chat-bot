@@ -24,6 +24,12 @@ plain-keyboard round trip an ``InlineQueryResultArticle`` markup has to make. Th
 icon and the native ``style`` do not conflict — the first names the action, the
 second tints the button — so both are set where both are wanted.
 
+Colour is reserved for meaning: ``success`` marks the one positive action of a
+screen, ``danger`` marks something destructive, and everything else — menu
+entries, drill-downs, back buttons — is left uncoloured. Tinting every button
+blue made a screen read as a wall of identical emphasis, so navigation carries
+no style at all.
+
 Note: ``main_menu_kb`` (the persistent ReplyKeyboardMarkup used for chat
 state navigation) lives in ``keyboards/reply.py`` and is unchanged. The
 functions here are inline keyboards for user-facing prompts and menus.
@@ -100,12 +106,10 @@ def welcome_inline_kb() -> InlineKeyboardMarkup:
     builder.button(
         text=f"{ICON_LINK} لینک ناشناس من",
         callback_data="user:welcome:link",
-        style="primary",
     )
     builder.button(
         text="👤 تکمیل پروفایل",
         callback_data="user:welcome:profile",
-        style="success",
     )
     builder.adjust(1, 2)
     return builder.as_markup()
@@ -136,7 +140,7 @@ def welcome_group_kb(bot_username: str) -> InlineKeyboardMarkup | None:
         InlineKeyboardButton(
             text=f"{ICON_JOIN} افزودن ربات به گروه",
             url=link,
-            style="primary",
+            style="success",
         ),
     )
     return builder.as_markup()
@@ -166,17 +170,14 @@ def wallet_kb(daily_claimable: bool = False) -> InlineKeyboardMarkup:
         builder.button(
             text=f"{ICON_INFO} اطلاعات",
             callback_data="wallet:info",
-            style="primary",
         )
     builder.button(
         text=f"{ICON_HISTORY} تاریخچه سکه",
         callback_data="wallet:history",
-        style="primary",
     )
     builder.button(
         text=f"{ICON_BACK} بازگشت به منوی اصلی",
         callback_data="wallet:back",
-        style="primary",
     )
     builder.adjust(1, 1, 1)
     return builder.as_markup()
@@ -189,7 +190,6 @@ def wallet_history_kb() -> InlineKeyboardMarkup:
     builder.button(
         text=f"{ICON_BACK} بازگشت به کیف پول",
         callback_data="wallet:open",
-        style="primary",
     )
     builder.adjust(1)
     return builder.as_markup()
@@ -249,18 +249,12 @@ def profile_edit_kb() -> InlineKeyboardMarkup:
         [🔙 بازگشت]
     """
     builder = InlineKeyboardBuilder()
-    builder.button(text="🎂 سن", callback_data="profile:edit:age", style="primary")
-    builder.button(text="🏙 شهر", callback_data="profile:edit:city", style="primary")
-    builder.button(
-        text="🚻 جنسیت", callback_data="profile:edit:gender", style="primary"
-    )
-    builder.button(text="📏 قد", callback_data="profile:edit:height", style="primary")
-    builder.button(
-        text="🖼 عکس پروفایل", callback_data="profile:edit:photo", style="primary"
-    )
-    builder.button(
-        text=f"{ICON_BACK} بازگشت", callback_data="profile:edit:back", style="primary"
-    )
+    builder.button(text="🎂 سن", callback_data="profile:edit:age")
+    builder.button(text="🏙 شهر", callback_data="profile:edit:city")
+    builder.button(text="🚻 جنسیت", callback_data="profile:edit:gender")
+    builder.button(text="📏 قد", callback_data="profile:edit:height")
+    builder.button(text="🖼 عکس پروفایل", callback_data="profile:edit:photo")
+    builder.button(text=f"{ICON_BACK} بازگشت", callback_data="profile:edit:back")
     builder.adjust(2, 2, 1, 1)
     return builder.as_markup()
 
@@ -291,12 +285,10 @@ def support_menu_kb(*, has_history: bool = False) -> InlineKeyboardMarkup:
         builder.button(
             text=f"{ICON_HISTORY} پیگیری‌های من",
             callback_data="support:history",
-            style="primary",
         )
     builder.button(
         text=f"{ICON_BACK} بازگشت به منوی اصلی",
         callback_data="support:back",
-        style="primary",
     )
     builder.adjust(1)
     return builder.as_markup()
@@ -313,12 +305,10 @@ def support_history_kb(rows: list[tuple[int, str]]) -> InlineKeyboardMarkup:
         builder.button(
             text=label,
             callback_data=f"support:view:{ticket_id}",
-            style="primary",
         )
     builder.button(
         text=f"{ICON_BACK} بازگشت",
         callback_data="support:home",
-        style="primary",
     )
     builder.adjust(1)
     return builder.as_markup()
@@ -340,12 +330,10 @@ def support_ticket_kb() -> InlineKeyboardMarkup:
     builder.button(
         text=f"{ICON_HISTORY} پیگیری‌های من",
         callback_data="support:history",
-        style="primary",
     )
     builder.button(
         text=f"{ICON_BACK} بازگشت",
         callback_data="support:home",
-        style="primary",
     )
     builder.adjust(1)
     return builder.as_markup()

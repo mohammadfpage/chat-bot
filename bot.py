@@ -10,22 +10,26 @@ then serves updates in whichever mode ``RUN_MODE`` selects:
   with Telegram via ``setWebhook``. The server speaks plain HTTP; the
   public https:// hop (cloudflared tunnel locally, a domain + TLS or a
   tunnel in production) is provided by whatever sits in front of it, so no
-  certificate ever has to be generated for a test run. See ``WEBHOOK.md``.
-
-Two pieces of the reply-keyboard policy live here:
+  certificate ever has to be generated for a test run. See ``WEBHOOK.md``.Two pieces of the reply-keyboard policy live here:
 
 * ``install_keyboard_guard(bot)`` — wraps the API session so a
   ``ReplyKeyboardMarkup`` aimed at a group is rewritten to
   ``ReplyKeyboardRemove`` before it is serialised. Enforced at the last hop
   before the wire, so it cannot be bypassed by a handler that forgets its
   ``ChatType`` filter.
-* ``dp.startup.register(cleanup_group_keyboards)`` — re-sends the removal into
-  every known group on start, because Telegram's per-chat keyboard cache
-  survives the bot being removed and re-added.
-* ``GroupKeyboardWatchMiddleware`` + ``group_lifecycle_router`` — the
-  "first sight" half: any group the bot hears from (or is added to) is
-  remembered in ``group_chats`` and cleared immediately, so a group that the
-  startup sweep has never seen before is covered without a restart.
+* ``GroupKeyboardWatchMiddleware`` + ``group_lifecycle_router`` —
+  the "first sight" half: any group the bot hears from (or is added to) is
+  remembered in ``group_chats`` and cleared once, so a group the bot has never
+  been swept over is covered without a restart.
+
+There is deliberately NO startup sweep of the groups any more. Telegram's
+per-chat keyboard cache does survive the bot being removed and re-added, but
+the repair for that was one invisible message posted into every known group on
+every single start — which reads as the bot posting test messages into other
+people's chats the moment it is started. Starting the bot is now silent in
+groups, always; ``middleware.keyboard_guard`` is what keeps a reply keyboard
+from ever coming back, and the first-sight clear remains available behind the
+``GROUP_KEYBOARD_CLEANUP`` switch for a one-off repair.
 """
 
 import asyncio
@@ -76,7 +80,6 @@ from middleware import (
     install_keyboard_guard,
 )
 from middleware.keyboard_guard import GuardedSession
-from utils.group_cleanup import cleanup_group_keyboards
 from utils.retention import start_retention, stop_retention
 from utils.group_commands import (
     admin_command_rows,
@@ -404,22 +407,6 @@ def _hook(name: str, fn):
 
     _wrapped.__name__ = f"hook_{name}"
     return _wrapped
-
-
-async def _spawn_keyboard_cleanup(bot: Bot) -> None:
-    """Run the reply-keyboard sweep in the BACKGROUND.
-
-    The sweep waits per chat (clients need the time to apply the removal),
-    so with a real fleet it takes minutes; holding ``start_polling`` that
-    long made the bot look dead — /start unanswered, updates queued. The
-    first-sight watcher in ``GroupKeyboardWatchMiddleware`` still covers
-    any group the sweep has not reached yet.
-    """
-    _keep(
-        asyncio.create_task(
-            cleanup_group_keyboards(bot), name="group-keyboard-cleanup"
-        )
-    )
 
 
 # ──────────────────────────────────────────────────────────────
@@ -763,16 +750,15 @@ async def build_bot_and_dispatcher() -> tuple[Bot, Dispatcher]:
     # the storage (to force the restored users back into in_chat/in_queue).
     dp.startup.register(_hook("rebuild_chat_state", rebuild_chat_state))
 
-    # ── Startup hook: purge cached group reply keyboards ──
-    # Telegram keys its reply-keyboard cache per chat and never flushes it when
-    # the bot is removed and re-added, so a group that ever received a
-    # ReplyKeyboardMarkup keeps it stuck at the bottom. This re-sends
-    # ReplyKeyboardRemove into every known group on each start; the guard above
-    # is what stops it from ever coming back. aiogram injects "bot" here.
-    # Spawned as a background task — see _spawn_keyboard_cleanup.
-    dp.startup.register(
-        _hook("cleanup_group_keyboards", _spawn_keyboard_cleanup)
-    )
+    # ── Startup: NOTHING is posted into groups. ──
+    # There used to be a ``cleanup_group_keyboards`` hook here that re-sent a
+    # (then deleted) message into every known group on every start, to flush
+    # Telegram's per-chat keyboard cache. That is exactly "the bot posts test
+    # messages into all groups when it runs", so it is gone: starting the bot
+    # is silent in groups. The session-level guard above is what keeps a reply
+    # keyboard from ever being sent to a group in the first place, and the
+    # opt-in first-sight clear in ``GroupKeyboardWatchMiddleware`` still covers
+    # a group that somehow carries an old one.
 
     # ── Startup hook: backfill the group roster ──
     # The in-memory roster the whisper pickers resolve recipients against only

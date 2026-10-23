@@ -28,11 +28,12 @@ from aiogram import F, Router
 from aiogram.enums import ChatType
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
-from aiogram.types import Message
+from aiogram.types import Message, ReplyKeyboardRemove
 
 from handlers.start import cmd_start
 from keyboards import (
     BACK_TO_MENU_TEXTS,
+    CLOSE_MENU_LABEL,
     anonymous_chat_menu_kb,
     chat_menu_kb,
     main_menu_kb,
@@ -75,12 +76,19 @@ async def _blocked_by_live_session(
     return False
 
 
-async def _to_main_menu(message: Message, state: FSMContext, note: str) -> None:
-    """Reset the FSM and put the main menu back on screen."""
+async def _leave_to_menu(message: Message, state: FSMContext, note: str) -> bool:
+    """Reset the FSM and leave the current page. ``False`` when refused.
+
+    Shared by the two exits: «🏠 منوی اصلی» swaps the screen for the menu,
+    «❌ بستن منو» takes the keyboard off the screen entirely. Doing it in one
+    place is what keeps the two answers to "get me out of here" from drifting
+    apart — same queue cleanup, same live-session guard, same single-write
+    reset.
+    """
     current = await state.get_state()
 
     if await _blocked_by_live_session(message, current):
-        return
+        return False
 
     # Leaving the search queue is harmless and must not leak a stale entry —
     # otherwise the user would still be sitting in ``search_queue`` (and in
@@ -100,6 +108,13 @@ async def _to_main_menu(message: Message, state: FSMContext, note: str) -> None:
     # menu tap costs zero statements.
     await state.set_state(ChatState.idle)
     await state.set_data({})
+    return True
+
+
+async def _to_main_menu(message: Message, state: FSMContext, note: str) -> None:
+    """Reset the FSM and put the main menu back on screen."""
+    if not await _leave_to_menu(message, state, note):
+        return
     await message.answer(note, reply_markup=main_menu_kb())
 
 
@@ -135,6 +150,29 @@ async def nav_start(message: Message, state: FSMContext) -> None:
 async def nav_back_to_menu(message: Message, state: FSMContext) -> None:
     """The "🏠 منوی اصلی" button — works from every wizard page."""
     await _to_main_menu(message, state, "منوی اصلی:")
+
+
+@router.message(
+    F.text == CLOSE_MENU_LABEL,
+    F.chat.type == ChatType.PRIVATE,
+)
+async def nav_close_menu(message: Message, state: FSMContext) -> None:
+    """«❌ بستن منو» — the keyboard leaves the screen, nothing else happens.
+
+    A reply keyboard only hides on Android when the back gesture is pressed
+    once, and a *second* press is what leaves the chat — which reads as "the
+    back button is broken" to somebody who wants out in one move. This is that
+    move: same reset as the main-menu button, but the answer carries a
+    ``ReplyKeyboardRemove`` instead of a keyboard, plus one line saying how to
+    get the menu back (``/start`` or ``/menu``, both owned by this router).
+    """
+    if not await _leave_to_menu(message, state, ""):
+        return
+
+    await message.answer(
+        "منوی بسته شد. برای بازکردن دوباره /start یا /menu را بفرستید.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
 
 
 @router.message(Command("menu"))

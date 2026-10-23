@@ -4,18 +4,17 @@ keyboard cleared once, immediately, without a restart.
 
 Why this exists
 ---------------
-``utils/group_cleanup`` sweeps every group it knows about at startup, but it
-can only know groups that are already in the database (whisper rows, the
-force-join target, ``group_chats``). A group the bot was *just* added to is
-invisible to that sweep — and Telegram caches the last reply keyboard **per
-chat** and never flushes it when the bot is removed and re-added. So a
-keyboard left behind by an older build would stay stuck at the bottom of that
-group for every member until a restart happened *after* the group was first
-recorded.
+Telegram caches the last reply keyboard **per chat** and never flushes it when
+the bot is removed and re-added — only a fresh ``ReplyKeyboardRemove`` does.
+A keyboard left behind by an older build would therefore stay stuck at the
+bottom of a group for every member, and there is no startup sweep to fix it any
+more (starting the bot must be silent in groups; see
+:mod:`utils.group_cleanup`).
 
-This middleware closes the gap at the earliest possible moment: the first
+This middleware closes that gap at the earliest possible moment: the first
 update that arrives from a group schedules
-:func:`clear_group_keyboard_once`, which registers the group and pushes one
+:func:`clear_group_keyboard_once`, which registers the group and — only when
+``GROUP_KEYBOARD_CLEANUP`` says so (it defaults to OFF) — pushes one
 ``ReplyKeyboardRemove`` into it. The clear itself runs as a fire-and-forget
 task so the 2-second client-settling delay inside the cleanup never holds up
 the update being handled.
@@ -24,11 +23,10 @@ Division of labour (all three pieces are needed):
 
 * ``middleware.keyboard_guard``  — makes it impossible to *send* a reply
   keyboard into a group in the first place (last-hop session guard).
-* this module                   — clears a keyboard that is *already* stuck
-  in a group the bot has never seen before in this process.
-* ``utils.group_cleanup``       — clears known groups again at every startup,
-  because the cached keyboard can also arrive from an older build while the
-  bot is offline.
+* this module                   — remembers every group the bot sees, and
+  clears a keyboard that is *already* stuck in one (opt-in).
+* ``utils.group_cleanup``       — the manual sweep, kept for a one-off repair
+  of a fleet; nothing calls it at startup.
 """
 
 from __future__ import annotations

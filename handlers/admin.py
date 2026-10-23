@@ -67,6 +67,7 @@ from keyboards.admin import (
     policy_field_emoji,
     policy_section_of,
 )
+from aiogram.types import ReplyKeyboardRemove
 from handlers.support import deliver_team_reply
 from states import (
     AdminBroadcast,
@@ -147,12 +148,94 @@ async def _find_user(user_id: int) -> User | None:
         return result.scalar_one_or_none()
 
 
-async def _edit_or_answer(callback: CallbackQuery, text: str, kb=None) -> None:
-    """Edit the panel message, falling back to a fresh answer on failure."""
+async def _edit_or_answer(callback: CallbackQuery, text: str, kb=None) -> Message:
+    """Edit the panel message, falling back to a fresh answer on failure.
+
+    Returns the message so a caller that opens an input flow can remember it
+    and later EDIT the prompt into the result instead of stacking a new card.
+    """
     try:
-        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+        edited = await callback.message.edit_text(
+            text, parse_mode="HTML", reply_markup=kb
+        )
+        return edited if isinstance(edited, Message) else callback.message
     except Exception:
-        await callback.message.answer(text, parse_mode="HTML", reply_markup=kb)
+        return await callback.message.answer(
+            text, parse_mode="HTML", reply_markup=kb
+        )
+
+
+#: FSM keys for the admin panel message that a callback edited into an input
+#: prompt. The prompt is reused for the result, so an admin action never leaves
+#: a "waiting for id" message above the card it produced.
+_ADMIN_PROMPT_ID = "admin_prompt_id"
+_ADMIN_PROMPT_CHAT = "admin_prompt_chat"
+
+
+async def _remember_admin_prompt(state: FSMContext, sent: Message) -> None:
+    await state.update_data(
+        **{_ADMIN_PROMPT_ID: sent.message_id, _ADMIN_PROMPT_CHAT: sent.chat.id}
+    )
+
+
+async def _admin_prompt_target(message: Message, state: FSMContext):
+    data = await state.get_data()
+    prompt_id = data.get(_ADMIN_PROMPT_ID)
+    chat_id = data.get(_ADMIN_PROMPT_CHAT) or message.chat.id
+    return chat_id, prompt_id
+
+
+async def _edit_admin_prompt(
+    message: Message, state: FSMContext, text: str, kb=None
+) -> bool:
+    """Edit the stored prompt into ``text``. Returns True on success."""
+    chat_id, prompt_id = await _admin_prompt_target(message, state)
+    if not prompt_id:
+        return False
+    try:
+        await message.bot.edit_message_text(
+            text,
+            chat_id=chat_id,
+            message_id=prompt_id,
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
+        return True
+    except Exception:
+        return False
+
+
+async def _reply_admin(
+    message: Message,
+    state: FSMContext,
+    text: str,
+    kb=None,
+    *,
+    clear_state: bool = True,
+) -> None:
+    """Answer an admin input by editing its prompt, not by posting a new card.
+
+    The old handlers sent a fresh message and left the "send an id" prompt on
+    screen, so the panel accumulated stale prompts. Editing the prompt keeps
+    ONE live message per action; the fallback still answers when the prompt was
+    deleted, too old, or is a media message.
+    """
+    edited = await _edit_admin_prompt(message, state, text, kb)
+    if not edited:
+        await message.answer(text, parse_mode="HTML", reply_markup=kb)
+    if clear_state:
+        await state.clear()
+
+
+async def _admin_input_error(
+    message: Message, state: FSMContext, text: str, kb=None
+) -> None:
+    """Show a validation error in the prompt and keep the state for a retry."""
+    edited = await _edit_admin_prompt(message, state, text, kb or admin_cancel_kb())
+    if not edited:
+        await message.answer(
+            text, parse_mode="HTML", reply_markup=kb or admin_cancel_kb()
+        )
 
 
 def _invalid_id_response(what: str) -> str:
@@ -176,7 +259,7 @@ async def cmd_admin(message: Message) -> None:
     find out what it holds.
     """
     is_root = _is_root(message.from_user.id)
-    await message.answer(
+    sent = await message.answer(
         "👑 <b>پنل مدیریت</b>\n\n"
         f"{get_plain_emoji('info')} خوش آمدید. از منوی زیر انتخاب کنید:\n"
         f"\n{get_plain_emoji('coins')} هزینهٔ سرویس‌ها، پاداش‌ها و جوایز "
@@ -184,8 +267,21 @@ async def cmd_admin(message: Message) -> None:
         f"{get_plain_emoji('chart')} گزارش اینکه هر کاربر چند سکه گرفته\n"
         + (f"\n⭐ شما ریشه‌ادمین هستید." if is_root else ""),
         parse_mode="HTML",
-        reply_markup=admin_panel_kb(is_root=is_root),
+        # The reply keyboard goes first: whatever the admin was sitting on —
+        # the user menu above all — is replaced with NOTHING, so the panel is
+        # the only thing on screen. The way back to the user side is the
+        # «👤 پنل کاربری» row of the panel itself.
+        reply_markup=ReplyKeyboardRemove(),
     )
+    # One message, two keyboards: the send above takes the reply keyboard off
+    # the screen, then the same message is re-keyed to the inline panel.
+    try:
+        await sent.edit_reply_markup(reply_markup=admin_panel_kb(is_root=is_root))
+    except Exception:
+        await message.answer(
+            "از منوی زیر انتخاب کنید:",
+            reply_markup=admin_panel_kb(is_root=is_root),
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -193,8 +289,9 @@ async def cmd_admin(message: Message) -> None:
 # ──────────────────────────────────────────────────────────────────────────
 
 @router.callback_query(F.data == "admin:panel")
-async def cb_back_to_panel(callback: CallbackQuery) -> None:
-    """Return to the main admin panel."""
+async def cb_back_to_panel(callback: CallbackQuery, state: FSMContext) -> None:
+    """Return to the main admin panel, abandoning any pending input."""
+    await state.clear()
     is_root = _is_root(callback.from_user.id)
     await _edit_or_answer(
         callback,
@@ -317,7 +414,7 @@ async def cb_broadcast_start(callback: CallbackQuery, state: FSMContext) -> None
     """Ask the admin to send the message content."""
     await state.set_state(AdminBroadcast.waiting_for_message)
     await state.set_data({})
-    await _edit_or_answer(
+    sent = await _edit_or_answer(
         callback,
         "📢 <b>ارسال پیام همگانی</b>\n\n"
         "اکنون پیام مورد نظر را ارسال کنید:\n"
@@ -325,6 +422,7 @@ async def cb_broadcast_start(callback: CallbackQuery, state: FSMContext) -> None
         "پس از آن، یک مرحله <b>تأیید</b> نمایش داده می‌شود.",
         admin_cancel_kb(),
     )
+    await _remember_admin_prompt(state, sent)
 
 
 @router.callback_query(F.data == "admin:broadcast:confirm")
@@ -362,11 +460,13 @@ async def cb_broadcast_confirm(callback: CallbackQuery, state: FSMContext) -> No
             failed += 1
         await asyncio.sleep(0.05)  # flood-limit friendly
 
-    await callback.message.answer(
+    # The confirmation card becomes the report — no dangling "send?" prompt.
+    await _edit_or_answer(
+        callback,
         f"📢 <b>گزارش ارسال همگانی</b>\n\n"
         f"{get_plain_emoji('check')} موفق: <b>{sent}</b>\n"
         f"{get_plain_emoji('cross')} ناموفق: <b>{failed}</b>",
-        parse_mode="HTML",
+        admin_panel_kb(is_root=_is_root(callback.from_user.id)),
     )
 
 
@@ -388,9 +488,13 @@ async def msg_broadcast_capture(message: Message, state: FSMContext) -> None:
     Capture the broadcast content (text/photo/video) and ask for confirmation.
     """
     if message.content_type not in ("text", "photo", "video"):
-        await message.answer(
+        # Reuse the prompt for the warning instead of stacking another message
+        # on top of it; the state is kept so the admin can resend the content.
+        await _admin_input_error(
+            message,
+            state,
             f"{get_plain_emoji('warning')} فقط متن، عکس یا ویدیو پشتیبانی می‌شود.",
-            parse_mode="HTML",
+            admin_cancel_kb(),
         )
         return
 
@@ -401,14 +505,18 @@ async def msg_broadcast_capture(message: Message, state: FSMContext) -> None:
     await state.set_state(AdminBroadcast.confirm_send)
 
     preview = message.caption or message.text or "پیام شما"
-    await message.answer(
+    text = (
         f"📢 <b>تأیید ارسال همگانی</b>\n\n"
         f"این پیام به <b>همه کاربران</b> ارسال می‌شود:\n"
         f"——————————————\n{escape(preview)}\n——————————————\n\n"
-        "آیا مطمئن هستید؟",
-        parse_mode="HTML",
-        reply_markup=broadcast_confirm_kb(),
+        "آیا مطمئن هستید؟"
     )
+    # Edit the "send the message" prompt into the confirmation card: the
+    # admin's content stays above it as the one message being previewed.
+    if not await _edit_admin_prompt(message, state, text, broadcast_confirm_kb()):
+        await message.answer(
+            text, parse_mode="HTML", reply_markup=broadcast_confirm_kb()
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -430,24 +538,26 @@ async def cb_users_menu(callback: CallbackQuery) -> None:
 async def cb_ban_start(callback: CallbackQuery, state: FSMContext) -> None:
     """Ask for the ID to ban."""
     await state.set_state(AdminPIS.waiting_for_ban_id)
-    await _edit_or_answer(
+    sent = await _edit_or_answer(
         callback,
         f"{get_plain_emoji('ban')} <b>بلاک‌کردن کاربر</b>\n\n"
         "آیدی عددی تلگرام کاربر را ارسال کنید:",
         admin_cancel_kb(),
     )
+    await _remember_admin_prompt(state, sent)
 
 
 @router.callback_query(F.data == "admin:user:unban")
 async def cb_unban_start(callback: CallbackQuery, state: FSMContext) -> None:
     """Ask for the ID to unban."""
     await state.set_state(AdminPIS.waiting_for_unban_id)
-    await _edit_or_answer(
+    sent = await _edit_or_answer(
         callback,
         f"{get_plain_emoji('unban')} <b>رفع بلاک کاربر</b>\n\n"
         "آیدی عددی تلگرام کاربر را ارسال کنید:",
         admin_cancel_kb(),
     )
+    await _remember_admin_prompt(state, sent)
 
 
 @router.message(AdminPIS.waiting_for_ban_id)
@@ -455,23 +565,35 @@ async def msg_ban_user(message: Message, state: FSMContext) -> None:
     """Ban the user whose numeric ID was provided."""
     target_id = await _parse_user_id(message.text or "")
     if target_id is None:
-        await message.answer(_invalid_id_response("بلاک‌کردن"))
+        await _admin_input_error(message, state, _invalid_id_response("بلاک‌کردن"))
         return
 
     if target_id in settings.admin_ids_list:
-        await message.answer("⛔ ریشه‌ادمین قابل بلاک نیست.")
-        await state.clear()
+        await _reply_admin(
+            message,
+            state,
+            "⛔ ریشه‌ادمین قابل بلاک نیست.",
+            admin_panel_kb(is_root=_is_root(message.from_user.id)),
+        )
         return
 
     target = await _find_user(target_id)
     if target is None:
-        await message.answer(f"{get_plain_emoji('cross')} کاربر <code>{target_id}</code> یافت نشد.")
-        await state.clear()
+        await _reply_admin(
+            message,
+            state,
+            f"{get_plain_emoji('cross')} کاربر <code>{target_id}</code> یافت نشد.",
+            admin_panel_kb(is_root=_is_root(message.from_user.id)),
+        )
         return
 
     if target.is_admin:
-        await message.answer("⛔ این کاربر ادمین است؛ ابتدا برکناری را بررسی کنید.")
-        await state.clear()
+        await _reply_admin(
+            message,
+            state,
+            "⛔ این کاربر ادمین است؛ ابتدا برکناری را بررسی کنید.",
+            admin_panel_kb(is_root=_is_root(message.from_user.id)),
+        )
         return
 
     async with async_session_factory() as session:
@@ -483,12 +605,12 @@ async def msg_ban_user(message: Message, state: FSMContext) -> None:
     # user's very next update instead of waiting out the cache TTL.
     forget_user_flags(target_id)
 
-    await message.answer(
+    await _reply_admin(
+        message,
+        state,
         f"{get_plain_emoji('ban')} کاربر <code>{target_id}</code> بلاک شد.",
-        parse_mode="HTML",
-        reply_markup=admin_panel_kb(is_root=_is_root(message.from_user.id)),
+        admin_panel_kb(is_root=_is_root(message.from_user.id)),
     )
-    await state.clear()
 
 
 @router.message(AdminPIS.waiting_for_unban_id)
@@ -496,13 +618,17 @@ async def msg_unban_user(message: Message, state: FSMContext) -> None:
     """Unban the user whose numeric ID was provided."""
     target_id = await _parse_user_id(message.text or "")
     if target_id is None:
-        await message.answer(_invalid_id_response("رفع بلاک"))
+        await _admin_input_error(message, state, _invalid_id_response("رفع بلاک"))
         return
 
     target = await _find_user(target_id)
     if target is None:
-        await message.answer(f"{get_plain_emoji('cross')} کاربر <code>{target_id}</code> یافت نشد.")
-        await state.clear()
+        await _reply_admin(
+            message,
+            state,
+            f"{get_plain_emoji('cross')} کاربر <code>{target_id}</code> یافت نشد.",
+            admin_panel_kb(is_root=_is_root(message.from_user.id)),
+        )
         return
 
     async with async_session_factory() as session:
@@ -517,12 +643,12 @@ async def msg_unban_user(message: Message, state: FSMContext) -> None:
     # And the cache must stop reporting "banned" for the user right away.
     forget_user_flags(target_id)
 
-    await message.answer(
+    await _reply_admin(
+        message,
+        state,
         f"{get_plain_emoji('unban')} بلاک کاربر <code>{target_id}</code> برداشته شد.",
-        parse_mode="HTML",
-        reply_markup=admin_panel_kb(is_root=_is_root(message.from_user.id)),
+        admin_panel_kb(is_root=_is_root(message.from_user.id)),
     )
-    await state.clear()
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -555,12 +681,13 @@ def _flags_card(user: User) -> str:
 async def cb_flags_start(callback: CallbackQuery, state: FSMContext) -> None:
     """Ask which user's paywall flags to edit."""
     await state.set_state(AdminPIS.waiting_for_flags_id)
-    await _edit_or_answer(
+    sent = await _edit_or_answer(
         callback,
         f"{get_plain_emoji('crown')} <b>وضعیت ویژهٔ کاربر</b>\n\n"
         "آیدی عددی کاربر را بفرستید:",
         admin_cancel_kb(),
     )
+    await _remember_admin_prompt(state, sent)
 
 
 @router.message(AdminPIS.waiting_for_flags_id)
@@ -568,22 +695,26 @@ async def msg_flags_target(message: Message, state: FSMContext) -> None:
     """Show the flag card for the requested user (state kept on a miss, for a retry)."""
     target_id = await _parse_user_id(message.text or "")
     if target_id is None:
-        await message.answer(_invalid_id_response("وضعیت ویژه"))
+        await _admin_input_error(message, state, _invalid_id_response("وضعیت ویژه"))
         return
 
     user = await _find_user(target_id)
     if user is None:
-        await message.answer(
-            f"{get_plain_emoji('cross')} کاربر <code>{target_id}</code> یافت نشد.",
-            parse_mode="HTML",
+        # Keep the state so the admin can retry with another id; the prompt is
+        # reused for the error instead of stacking a second message.
+        await _admin_input_error(
+            message,
+            state,
+            f"{get_plain_emoji('cross')} کاربر <code>{target_id}</code> یافت نشد.\n"
+            "یک آیدی دیگر بفرستید یا «لغو» را بزنید.",
         )
         return
 
-    await state.clear()
-    await message.answer(
+    await _reply_admin(
+        message,
+        state,
         _flags_card(user),
-        parse_mode="HTML",
-        reply_markup=admin_user_flags_kb(
+        admin_user_flags_kb(
             target_id,
             is_vip=user.is_vip,
             has_subscription=user.has_subscription,
@@ -901,13 +1032,14 @@ async def cb_support_reply(callback: CallbackQuery, state: FSMContext) -> None:
 
     await state.set_state(AdminSupport.waiting_for_reply)
     await state.set_data({"ticket_id": ticket_id})
-    await _edit_or_answer(
+    sent = await _edit_or_answer(
         callback,
         f"✍️ <b>پاسخ به تیکت #{ticket_id}</b>\n\n"
         "متن پاسخ را بنویسید. این متن با سلام و سپاس‌گزاری تیم برای کاربر "
         "ارسال می‌شود.",
         admin_cancel_kb(),
     )
+    await _remember_admin_prompt(state, sent)
 
 
 async def _set_ticket_status(
@@ -963,9 +1095,8 @@ async def admin_support_send_reply(message: Message, state: FSMContext) -> None:
     content = (message.text or "").strip()
 
     if not ticket_id or not content:
-        await message.answer(
-            "❌ پاسخ نامعتبر است. دوباره تلاش کنید.",
-            reply_markup=admin_cancel_kb(),
+        await _admin_input_error(
+            message, state, "❌ پاسخ نامعتبر است. دوباره تلاش کنید."
         )
         return
 
@@ -996,14 +1127,14 @@ async def admin_support_send_reply(message: Message, state: FSMContext) -> None:
     # Telegram calls wait until the session is closed — see the session-scan
     # smoke rule enforced across every handler.
     if missing:
-        await state.clear()
-        await message.answer(
+        await _reply_admin(
+            message,
+            state,
             "تیکت پیدا نشد؛ بازگشت به پنل.",
-            reply_markup=admin_panel_kb(is_root=_is_root(message.from_user.id)),
+            admin_panel_kb(is_root=_is_root(message.from_user.id)),
         )
         return
 
-    await state.clear()
     delivered = await deliver_team_reply(message.bot, user_id, content)
     note = (
         "✅ پاسخ برای کاربر ارسال شد."
@@ -1012,10 +1143,11 @@ async def admin_support_send_reply(message: Message, state: FSMContext) -> None:
     )
 
     text, kb, found = await _render_admin_ticket(ticket_id)
-    await message.answer(
+    await _reply_admin(
+        message,
+        state,
         f"{note}\n\n{text}" if found else note,
-        parse_mode="HTML",
-        reply_markup=kb if found else admin_panel_kb(is_root=_is_root(message.from_user.id)),
+        kb if found else admin_panel_kb(is_root=_is_root(message.from_user.id)),
     )
 
 
@@ -1065,24 +1197,26 @@ async def cb_admin_list(callback: CallbackQuery) -> None:
 async def cb_promote_start(callback: CallbackQuery, state: FSMContext) -> None:
     """Ask for the ID to promote."""
     await state.set_state(AdminPIS.waiting_for_promote_id)
-    await _edit_or_answer(
+    sent = await _edit_or_answer(
         callback,
         f"{get_plain_emoji('check')} <b>ارتقا به ادمین</b>\n\n"
         f"آیدی عددی تلگرام کاربر را ارسال کنید:",
         admin_cancel_kb(),
     )
+    await _remember_admin_prompt(state, sent)
 
 
 @router.callback_query(F.data == "admin:admins:demote", IsRootAdmin())
 async def cb_demote_start(callback: CallbackQuery, state: FSMContext) -> None:
     """Ask for the ID to demote."""
     await state.set_state(AdminPIS.waiting_for_demote_id)
-    await _edit_or_answer(
+    sent = await _edit_or_answer(
         callback,
         f"{get_plain_emoji('cross')} <b>برکناری ادمین</b>\n\n"
         f"آیدی عددی تلگرام ادمین موردنظر را ارسال کنید:",
         admin_cancel_kb(),
     )
+    await _remember_admin_prompt(state, sent)
 
 
 @router.message(AdminPIS.waiting_for_promote_id, IsRootAdmin())
@@ -1090,21 +1224,26 @@ async def msg_promote(message: Message, state: FSMContext) -> None:
     """Promote the user to admin."""
     target_id = await _parse_user_id(message.text or "")
     if target_id is None:
-        await message.answer(_invalid_id_response("ارتقا"))
+        await _admin_input_error(message, state, _invalid_id_response("ارتقا"))
         return
 
     if target_id in settings.admin_ids_list:
-        await message.answer("⭐ این کاربر از قبل ریشه‌ادمین است.")
-        await state.clear()
+        await _reply_admin(
+            message,
+            state,
+            "⭐ این کاربر از قبل ریشه‌ادمین است.",
+            admin_panel_kb(is_root=True),
+        )
         return
 
     target = await _find_user(target_id)
     if target is None:
-        await message.answer(
+        await _reply_admin(
+            message,
+            state,
             f"{get_plain_emoji('cross')} کاربر <code>{target_id}</code> هنوز ربات را استارت نزده است.",
-            parse_mode="HTML",
+            admin_panel_kb(is_root=True),
         )
-        await state.clear()
         return
 
     async with async_session_factory() as session:
@@ -1114,12 +1253,12 @@ async def msg_promote(message: Message, state: FSMContext) -> None:
 
     forget_user_flags(target_id)
 
-    await message.answer(
+    await _reply_admin(
+        message,
+        state,
         f"{get_plain_emoji('success')} کاربر <code>{target_id}</code> ادمین شد.",
-        parse_mode="HTML",
-        reply_markup=admin_panel_kb(is_root=True),
+        admin_panel_kb(is_root=True),
     )
-    await state.clear()
 
 
 @router.message(AdminPIS.waiting_for_demote_id, IsRootAdmin())
@@ -1127,21 +1266,26 @@ async def msg_demote(message: Message, state: FSMContext) -> None:
     """Demote an admin (root admins cannot be demoted)."""
     target_id = await _parse_user_id(message.text or "")
     if target_id is None:
-        await message.answer(_invalid_id_response("برکناری"))
+        await _admin_input_error(message, state, _invalid_id_response("برکناری"))
         return
 
     if target_id in settings.admin_ids_list:
-        await message.answer("⛔ ریشه‌ادمین را نمی‌توان برکنار کرد.")
-        await state.clear()
+        await _reply_admin(
+            message,
+            state,
+            "⛔ ریشه‌ادمین را نمی‌توان برکنار کرد.",
+            admin_panel_kb(is_root=True),
+        )
         return
 
     target = await _find_user(target_id)
     if target is None or not target.is_admin:
-        await message.answer(
+        await _reply_admin(
+            message,
+            state,
             f"{get_plain_emoji('cross')} کاربر <code>{target_id}</code> ادمین نیست.",
-            parse_mode="HTML",
+            admin_panel_kb(is_root=True),
         )
-        await state.clear()
         return
 
     async with async_session_factory() as session:
@@ -1151,12 +1295,12 @@ async def msg_demote(message: Message, state: FSMContext) -> None:
 
     forget_user_flags(target_id)
 
-    await message.answer(
+    await _reply_admin(
+        message,
+        state,
         f"{get_plain_emoji('success')} ادمین <code>{target_id}</code> برکنار شد.",
-        parse_mode="HTML",
-        reply_markup=admin_panel_kb(is_root=True),
+        admin_panel_kb(is_root=True),
     )
-    await state.clear()
 
 # ──────────────────────────────────────────────────────────────────────────
 # 5. Economy settings — what costs, what pays out, what is limited
@@ -1308,13 +1452,14 @@ async def _begin_policy_edit(
     else:
         hint = "<i>عدد صحیح مثبت بفرستید؛ ۰ یعنی غیرفعال.</i>"
         current_text = str(current or 0)
-    await _edit_or_answer(
+    sent = await _edit_or_answer(
         callback,
         f"{emoji} <b>ویرایش: {label}</b>\n\n"
         f"مقدار فعلی: <b>{current_text}</b>\n\n"
         f"مقدار جدید را بفرستید:\n{hint}",
         admin_costs_edit_kb(suffix) if section == "costs" else admin_cancel_kb(),
     )
+    await _remember_admin_prompt(state, sent)
 
 
 @router.callback_query(F.data.startswith("admin:costs:edit:"))
@@ -1368,8 +1513,12 @@ async def msg_policy_value(message: Message, state: FSMContext) -> None:
     field_name = data.get("field")
     section = data.get("section", "limits")
     if not field_name or policy_section_of(field_name) is None:
-        await state.clear()
-        await message.answer("⚠️ فیلد نامعتبر.", reply_markup=admin_panel_kb(is_root=_is_root(message.from_user.id)))
+        await _reply_admin(
+            message,
+            state,
+            "⚠️ فیلد نامعتبر.",
+            admin_panel_kb(is_root=_is_root(message.from_user.id)),
+        )
         return
 
     raw = (message.text or "").strip()
@@ -1377,18 +1526,22 @@ async def msg_policy_value(message: Message, state: FSMContext) -> None:
     if is_cost:
         value = parse_amount(raw)
         if value is None:
-            await message.answer(
-                "لطفاً یک عدد غیرمنفی وارد کنید (مثلاً ۲ یا ۲٫۵)."
+            await _admin_input_error(
+                message,
+                state,
+                "لطفاً یک عدد غیرمنفی وارد کنید (مثلاً ۲ یا ۲٫۵).",
+                admin_cancel_kb(),
             )
             return
     else:
         value = parse_int(raw)
         if value is None:
-            await message.answer("لطفاً یک عدد صحیح وارد کنید.")
+            await _admin_input_error(
+                message, state, "لطفاً یک عدد صحیح وارد کنید.", admin_cancel_kb()
+            )
             return
 
     await _set_policy_field(field_name, value)
-    await state.clear()
 
     policy = await get_policy()
     label = policy_field_label(field_name)
@@ -1406,11 +1559,13 @@ async def msg_policy_value(message: Message, state: FSMContext) -> None:
         "limits": _limits_text,
     }.get(section, _limits_text)(policy)
 
-    await message.answer(
-        f"{get_plain_emoji('check')} <b>{label}</b> = <b>{shown}</b> ثبت شد.",
-        parse_mode="HTML",
+    await _reply_admin(
+        message,
+        state,
+        f"{get_plain_emoji('check')} <b>{label}</b> = <b>{shown}</b> ثبت شد.\n\n"
+        + text,
+        kb,
     )
-    await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -1616,10 +1771,12 @@ async def cb_gift_confirm(callback: CallbackQuery, state: FSMContext) -> None:
         per = f"{int(amount)} روز اشتراک"
 
     if not granted:
-        await callback.message.answer(
+        # The confirmation card becomes the failure report — posting a second
+        # message would leave the «تأیید» prompt looking like it is still live.
+        await _edit_or_answer(
+            callback,
             f"{get_plain_emoji('warning')} کاربر فعالی برای هدیه وجود ندارد.",
-            parse_mode="HTML",
-            reply_markup=admin_panel_kb(is_root=_is_root(callback.from_user.id)),
+            admin_panel_kb(is_root=_is_root(callback.from_user.id)),
         )
         return
 
@@ -1627,12 +1784,12 @@ async def cb_gift_confirm(callback: CallbackQuery, state: FSMContext) -> None:
     # take ~0.05s each, so the admin gets their panel back right away.
     _spawn_gift_notify(_notify_gifted(callback.bot, granted, per))
 
-    await callback.message.answer(
+    await _edit_or_answer(
+        callback,
         f"{get_plain_emoji('check')} <b>هدیه انجام شد</b>\n\n"
         f"{per} به <b>{len(granted)} کاربر</b> اضافه شد.\n"
         f"{get_plain_emoji('send')} در حال اطلاع‌رسانی به گیرندگان…",
-        parse_mode="HTML",
-        reply_markup=admin_panel_kb(is_root=_is_root(callback.from_user.id)),
+        admin_panel_kb(is_root=_is_root(callback.from_user.id)),
     )
 
 
@@ -1654,7 +1811,7 @@ async def cb_gift_scope(callback: CallbackQuery, state: FSMContext) -> None:
 
     if scope == "one":
         await state.set_state(AdminGift.waiting_for_user_id)
-        await _edit_or_answer(
+        sent = await _edit_or_answer(
             callback,
             f"<b>هدیه {_GIFT_LABELS[gift_type]} به یک کاربر</b>\n\n"
             "آیدی عددی تلگرام گیرنده را بفرستید:",
@@ -1662,7 +1819,7 @@ async def cb_gift_scope(callback: CallbackQuery, state: FSMContext) -> None:
         )
     elif scope == "random":
         await state.set_state(AdminGift.waiting_for_count)
-        await _edit_or_answer(
+        sent = await _edit_or_answer(
             callback,
             f"<b>هدیه {_GIFT_LABELS[gift_type]} به n کاربر تصادفی</b>\n\n"
             f"تعداد کاربران را وارد کنید (حداکثر <b>{user_count}</b>):",
@@ -1671,7 +1828,10 @@ async def cb_gift_scope(callback: CallbackQuery, state: FSMContext) -> None:
     else:  # "all"
         await state.set_state(AdminGift.waiting_for_amount)
         data = await state.get_data()
-        await _edit_or_answer(callback, _gift_amount_prompt(data), admin_cancel_kb())
+        sent = await _edit_or_answer(
+            callback, _gift_amount_prompt(data), admin_cancel_kb()
+        )
+    await _remember_admin_prompt(state, sent)
 
 
 @router.message(AdminGift.waiting_for_user_id)
@@ -1679,18 +1839,18 @@ async def msg_gift_user(message: Message, state: FSMContext) -> None:
     """Capture the one-user gift's recipient, then ask for the amount."""
     target_id = await _parse_user_id(message.text or "")
     if target_id is None:
-        await message.answer(_invalid_id_response("هدیه"))
+        await _admin_input_error(message, state, _invalid_id_response("هدیه"))
         return
 
     await state.update_data(target_id=target_id)
     await state.set_state(AdminGift.waiting_for_amount)
 
     data = await state.get_data()
-    await message.answer(
-        _gift_amount_prompt(data),
-        parse_mode="HTML",
-        reply_markup=admin_cancel_kb(),
-    )
+    text = _gift_amount_prompt(data)
+    if not await _edit_admin_prompt(message, state, text, admin_cancel_kb()):
+        await message.answer(
+            text, parse_mode="HTML", reply_markup=admin_cancel_kb()
+        )
 
 
 @router.message(AdminGift.waiting_for_count)
@@ -1698,26 +1858,30 @@ async def msg_gift_count(message: Message, state: FSMContext) -> None:
     """Capture how many users a random gift should reach."""
     count = parse_int((message.text or "").strip())
     if count is None or count <= 0:
-        await message.answer("لطفاً یک عدد مثبت وارد کنید.")
+        await _admin_input_error(
+            message, state, "لطفاً یک عدد مثبت وارد کنید.", admin_cancel_kb()
+        )
         return
 
     pool_size = await _active_user_count()
     if count > pool_size:
-        await message.answer(
+        await _admin_input_error(
+            message,
+            state,
             f"{get_plain_emoji('warning')} حداکثر تعداد کاربران فعال "
             f"<b>{pool_size}</b> نفر است.",
-            parse_mode="HTML",
+            admin_cancel_kb(),
         )
         return
 
     await state.update_data(recipient_count=count)
     await state.set_state(AdminGift.waiting_for_amount)
     data = await state.get_data()
-    await message.answer(
-        _gift_amount_prompt(data),
-        parse_mode="HTML",
-        reply_markup=admin_cancel_kb(),
-    )
+    text = _gift_amount_prompt(data)
+    if not await _edit_admin_prompt(message, state, text, admin_cancel_kb()):
+        await message.answer(
+            text, parse_mode="HTML", reply_markup=admin_cancel_kb()
+        )
 
 
 @router.message(AdminGift.waiting_for_amount)
@@ -1736,7 +1900,9 @@ async def msg_gift_amount(message: Message, state: FSMContext) -> None:
     else:
         amount = parse_int(raw)
     if amount is None or amount <= 0:
-        await message.answer("لطفاً یک عدد مثبت وارد کنید.")
+        await _admin_input_error(
+            message, state, "لطفاً یک عدد مثبت وارد کنید.", admin_cancel_kb()
+        )
         return
     if gift_type == "coins":
         amount = round_coins(amount)
@@ -1746,11 +1912,11 @@ async def msg_gift_amount(message: Message, state: FSMContext) -> None:
         # the total and wait for an explicit tap on «تأیید و اهداء».
         await state.update_data(amount=amount)
         await state.set_state(AdminGift.confirm_send)
-        await message.answer(
-            await _gift_confirm_text({**data, "amount": amount}),
-            parse_mode="HTML",
-            reply_markup=admin_gift_confirm_kb(),
-        )
+        text = await _gift_confirm_text({**data, "amount": amount})
+        if not await _edit_admin_prompt(message, state, text, admin_gift_confirm_kb()):
+            await message.answer(
+                text, parse_mode="HTML", reply_markup=admin_gift_confirm_kb()
+            )
         return
 
     target_id = data.get("target_id")
@@ -1769,15 +1935,13 @@ async def msg_gift_amount(message: Message, state: FSMContext) -> None:
         )
 
     if not ok:
-        await message.answer(
+        await _reply_admin(
+            message,
+            state,
             f"کاربر <code>{target_id}</code> یافت نشد.",
-            parse_mode="HTML",
-            reply_markup=admin_panel_kb(is_root=_is_root(message.from_user.id)),
+            admin_panel_kb(is_root=_is_root(message.from_user.id)),
         )
-        await state.clear()
         return
-
-    await state.clear()
 
     # Notify the recipient
     try:
@@ -1796,10 +1960,11 @@ async def msg_gift_amount(message: Message, state: FSMContext) -> None:
     except Exception:
         pass
 
-    await message.answer(
+    await _reply_admin(
+        message,
+        state,
         result_text,
-        parse_mode="HTML",
-        reply_markup=admin_panel_kb(is_root=_is_root(message.from_user.id)),
+        admin_panel_kb(is_root=_is_root(message.from_user.id)),
     )
 
 
@@ -1890,13 +2055,14 @@ async def cb_whisper_maxlen_start(callback: CallbackQuery, state: FSMContext) ->
     """Ask for a new character limit for a single whisper."""
     config = await get_whisper_config()
     await state.set_state(AdminWhisper.waiting_for_max_length)
-    await _edit_or_answer(
+    sent = await _edit_or_answer(
         callback,
-        f"{get_plain_emoji('edit')} <b>حداکثر طول متن نجوا</b>\n\n"
-        f"مقدار فعلی: <b>{config.max_length}</b> کاراکتر\n\n"
-        "عددی بین <b>۱۰۰</b> و <b>۴۰۹۶</b> بفرستید:",
+        f"🔤 <b>حداکثر تعداد کاراکتر نجوا</b>\n\n"
+        f"مقدار فعلی: <b>{config.max_length}</b>\n\n"
+        "عدد جدید را وارد کنید (مثلاً ۱۰۰ تا ۵۰۰):",
         admin_cancel_kb(),
     )
+    await _remember_admin_prompt(state, sent)
 
 
 @router.message(AdminWhisper.waiting_for_max_length)
@@ -1904,21 +2070,22 @@ async def msg_whisper_maxlen(message: Message, state: FSMContext) -> None:
     """Persist the new limit and return to the whisper screen."""
     value = parse_int((message.text or "").strip())
     if value is None or not (100 <= value <= 4096):
-        await message.answer("لطفاً عدد صحیحی بین ۱۰۰ و ۴۰۹۶ وارد کنید.")
+        await _admin_input_error(
+            message,
+            state,
+            "لطفاً عدد صحیحی بین ۱۰۰ و ۴۰۹۶ وارد کنید.",
+            admin_cancel_kb(),
+        )
         return
 
     await _mutate_whisper_config(max_length=value)
-    await state.clear()
-
-    await message.answer(
-        f"{get_plain_emoji('check')} حداکثر طول متن = <b>{value}</b> کاراکتر ثبت شد.",
-        parse_mode="HTML",
-    )
     config = await get_whisper_config()
-    await message.answer(
-        await _whisper_config_text(config),
-        parse_mode="HTML",
-        reply_markup=admin_whisper_kb(config),
+    await _reply_admin(
+        message,
+        state,
+        f"{get_plain_emoji('check')} حداکثر طول متن = <b>{value}</b> کاراکتر ثبت شد.\n\n"
+        + (await _whisper_config_text(config)),
+        admin_whisper_kb(config),
     )
 
 
@@ -2142,7 +2309,7 @@ async def cb_forcejoin_channels(callback: CallbackQuery) -> None:
 async def cb_forcejoin_channels_new(callback: CallbackQuery, state: FSMContext) -> None:
     """Ask the admin for the next channel to append to the list."""
     await state.set_state(AdminWhisper.waiting_for_channel)
-    await _edit_or_answer(
+    sent = await _edit_or_answer(
         callback,
         f"{get_plain_emoji('add')} <b>افزودن کانال/گروه عضویت اجباری</b>\n\n"
         "ربات باید در آن کانال یا گروه <b>ادمین</b> باشد تا بتواند اعضا را "
@@ -2153,6 +2320,7 @@ async def cb_forcejoin_channels_new(callback: CallbackQuery, state: FSMContext) 
         "• یا پیامی را از همان کانال/گروه <b>فاروارد</b> کنید",
         admin_cancel_kb(),
     )
+    await _remember_admin_prompt(state, sent)
 
 
 @router.message(AdminWhisper.waiting_for_channel)
@@ -2162,11 +2330,12 @@ async def msg_forcejoin_channel(message: Message, state: FSMContext) -> None:
 
     chat_id, username, title = await resolve_chat_ref(message.bot, str(chat_ref))
     if not chat_id:
-        await message.answer(
+        await _admin_input_error(
+            message,
+            state,
             f"{get_plain_emoji('cross')} <b>این کانال/گروه پیدا نشد.</b>\n\n"
             "آیدی عددی، یوزرنیم یا لینک درست را بفرستید، "
             "یا یک پیام از همان کانال/گروه فاروارد کنید.",
-            reply_markup=admin_cancel_kb(),
         )
         return
 
@@ -2177,7 +2346,7 @@ async def msg_forcejoin_channel(message: Message, state: FSMContext) -> None:
     if rights_error:
         # The state is deliberately KEPT: after promoting the bot the admin
         # can resend the very same input without pressing «افزودن کانال» again.
-        await message.answer(rights_error, reply_markup=admin_cancel_kb())
+        await _admin_input_error(message, state, rights_error)
         return
 
     # The confirmation is a message send — a network call — so it is composed
@@ -2225,17 +2394,15 @@ async def msg_forcejoin_channel(message: Message, state: FSMContext) -> None:
                 f"{escape(title or str(chat_id))}"
             )
 
-    if added_text:
-        await message.answer(added_text)
-
-    await state.clear()
     config = await get_whisper_config()
     channels = await _list_required_channels()
     unchecked = await _unchecked_channel_ids(message.bot, channels)
-    await message.answer(
-        _forcejoin_text(channels, config, unchecked),
-        parse_mode="HTML",
-        reply_markup=admin_forcejoin_channels_kb(channels, unchecked),
+    text = _forcejoin_text(channels, config, unchecked)
+    await _reply_admin(
+        message,
+        state,
+        (added_text + "\n\n" + text) if added_text else text,
+        admin_forcejoin_channels_kb(channels, unchecked),
     )
 
 
@@ -2510,12 +2677,13 @@ async def cb_report(callback: CallbackQuery) -> None:
 async def cb_report_user_search(callback: CallbackQuery, state: FSMContext) -> None:
     """Ask for the ID whose ledger card the admin wants."""
     await state.set_state(AdminReport.waiting_for_user_id)
-    await _edit_or_answer(
+    sent = await _edit_or_answer(
         callback,
         f"{get_plain_emoji('search')} <b>گزارش سکهٔ کاربر</b>\n\n"
         "آیدی عددی تلگرام کاربر را بفرستید:",
         admin_cancel_kb(),
     )
+    await _remember_admin_prompt(state, sent)
 
 
 @router.message(AdminReport.waiting_for_user_id)
@@ -2523,17 +2691,17 @@ async def msg_report_user(message: Message, state: FSMContext) -> None:
     """Render the ledger card for the ID that was typed."""
     target_id = await _parse_user_id(message.text or "")
     if target_id is None:
-        await message.answer(_invalid_id_response("گزارش"))
+        await _admin_input_error(message, state, _invalid_id_response("گزارش"))
         return
 
     text = await _user_report_text(target_id)
     if text is None:
-        await message.answer(
-            f"{get_plain_emoji('cross')} کاربر <code>{target_id}</code> یافت نشد.",
-            parse_mode="HTML",
-            reply_markup=admin_cancel_kb(),
+        await _admin_input_error(
+            message,
+            state,
+            f"{get_plain_emoji('cross')} کاربر <code>{target_id}</code> یافت نشد.\n"
+            "یک آیدی دیگر بفرستید یا «لغو» را بزنید.",
         )
         return
 
-    await state.clear()
-    await message.answer(text, parse_mode="HTML", reply_markup=admin_report_kb())
+    await _reply_admin(message, state, text, admin_report_kb())

@@ -59,10 +59,15 @@ from database import (
     UserReport,
 )
 from keyboards import (
+    CONNECT_LABEL,
+    LEGACY_RANDOM_CONNECT_LABEL,
+    OLD_ANON_CONNECT_LABEL,
+    OLD_CONNECT_LABEL,
     NEXT_CHAT_LABEL,
     REMATCH_LABEL,
     chat_end_kb,
     main_menu_kb,
+    match_mode_kb,
     queue_menu_kb,
     chat_menu_kb,
     rematch_offer_kb,
@@ -322,11 +327,18 @@ _EXPIRY_SWEEP_SECONDS = 300
 
 _expiry_task: asyncio.Task | None = None
 
-#: Which mode a user pressing ``label`` is asking for. ``None`` = اتصال شانسی,
+#: Which mode a user pressing ``label`` is asking for. ``None`` = «شانسی»,
 #: which also means "I will take anyone" — and is free exactly as long as the
 #: admin leaves ``random_chat_cost`` at 0.
 _LABEL_TO_MODE: dict[str, MatchMode] = {
     RANDOM_CONNECT_LABEL: None,
+    # The old spellings of the free option. A reply keyboard already on screen
+    # is not re-sent until the next tap, so for one round after a relabel the
+    # stale button must still work — it maps to the same mode instead of
+    # falling through to "no idea what this text means".
+    LEGACY_RANDOM_CONNECT_LABEL: None,
+    OLD_CONNECT_LABEL: None,
+    OLD_ANON_CONNECT_LABEL: None,
     CHAT_WITH_GIRL_LABEL: MODE_GIRL,
     CHAT_WITH_BOY_LABEL: MODE_BOY,
 }
@@ -819,11 +831,27 @@ async def _force_end(
 # Start search / find partner
 # ──────────────────────────────────────────────────
 
+@router.message(F.text == CONNECT_LABEL)
+async def choose_match_mode(message: Message) -> None:
+    """Step 1 of «به یه ناشناس وصلم کن»: ask WHO before searching.
+
+    The old single button dropped everyone into a random queue, so the two
+    gender-targeted (paid) modes were a separate row users had to understand
+    before they could use them. One friendly entry point plus one question is
+    simpler: the chooser shows all three answers in the same place, and the
+    paid ones are tinted so the price is visible before the tap.
+    """
+    await message.answer(
+        "با کی می‌خوای چت کنی؟",
+        reply_markup=match_mode_kb(),
+    )
+
+
 @router.message(F.text.in_(list(_LABEL_TO_MODE)))
 async def start_search(
     message: Message, state: FSMContext, fsm_storage: BaseStorage
 ) -> None:
-    """Match the user, in whichever of the three modes they asked for."""
+    """Step 2: match the user, in whichever mode they picked."""
     await _begin_search(
         message, state, fsm_storage, _LABEL_TO_MODE[message.text.strip()]
     )

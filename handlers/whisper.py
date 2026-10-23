@@ -71,8 +71,13 @@ from handlers.inline_anon import (
     whisper_notice_text,
 )
 from keyboards import (
+    CLOSE_MENU_LABEL,
+    CONNECT_LABEL,
     INLINE_HELP_LABEL,
     NEXT_CHAT_LABEL,
+    OLD_ANON_CONNECT_LABEL,
+    OLD_CONNECT_LABEL,
+    RANDOM_CONNECT_LABEL,
     REMATCH_LABEL,
     SUPPORT_LABEL,
     main_menu_kb,
@@ -1062,12 +1067,16 @@ async def cb_whisper_check(
 #: is kept for the same reason: an end card can be on screen when the whisper
 #: draft gets parked, and a swallowed tap there is a trap.
 _MENU_ESCAPE_TEXTS = {
-    "🔀 اتصال شانسی",
+    CLOSE_MENU_LABEL,
+    CONNECT_LABEL,
+    RANDOM_CONNECT_LABEL,
+    OLD_CONNECT_LABEL,
+    OLD_ANON_CONNECT_LABEL,
+    "🎲 فرقی نداره",
     "👩 چت با دختر",
     "👨 چت با پسر",
     NEXT_CHAT_LABEL,
     REMATCH_LABEL,
-    "🔗 اتصال به ناشناس",
     "👤 پروفایل من",
     "📩 پیام‌های ناشناس من",
     "📬 پیام‌های ناشناس من",

@@ -32,9 +32,14 @@ def _button(
     callback_data: str,
     emoji: str,
     *,
-    style: str = "primary",
+    style: str | None = None,
 ) -> InlineKeyboardButton:
-    """Create an inline button with an emoji and native styling."""
+    """Create an inline button with an emoji and optional native styling.
+
+    The default is *uncoloured*: navigation and menu rows read as a list, and
+    only the calls that pass ``success``/``danger`` (a positive action, a
+    destructive one, a live toggle) paint themselves.
+    """
     return InlineKeyboardButton(
         text=f"{get_plain_emoji(emoji)} {text}",
         callback_data=callback_data,
@@ -64,7 +69,8 @@ def admin_panel_kb(*, is_root: bool = False) -> InlineKeyboardMarkup:
     last ``.adjust`` value repeats for the final row — so the keyboard re-flows
     to 11 buttons (no root) or 13 (root) without the layout being written
     twice. Support sits alone on its row: it is an inbox that needs a reply
-    count, not a setting that pairs with a neighbour.
+    count, not a setting that pairs with a neighbour. The last row is always
+    the exit to the user panel.
 
     Args:
         is_root: ``True`` when the viewer is a Root (Super) Admin.
@@ -75,13 +81,11 @@ def admin_panel_kb(*, is_root: bool = False) -> InlineKeyboardMarkup:
     builder.button(
         text=f"{get_plain_emoji('stats')} آمار زنده",
         callback_data="admin:stats",
-        style="primary",
         icon_custom_emoji_id=get_premium_id("stats"),
     )
     builder.button(
         text=f"{get_plain_emoji('broadcast')} ارسال همگانی",
         callback_data="admin:broadcast",
-        style="primary",
         icon_custom_emoji_id=get_premium_id("broadcast"),
     )
 
@@ -89,7 +93,6 @@ def admin_panel_kb(*, is_root: bool = False) -> InlineKeyboardMarkup:
     builder.button(
         text=f"{get_plain_emoji('users')} مدیریت کاربران",
         callback_data="admin:users",
-        style="primary",
         icon_custom_emoji_id=get_premium_id("users"),
     )
     builder.button(
@@ -117,13 +120,11 @@ def admin_panel_kb(*, is_root: bool = False) -> InlineKeyboardMarkup:
     builder.button(
         text=f"{get_plain_emoji('blocked')} ضداسپم و محدودیت",
         callback_data="admin:limits",
-        style="primary",
         icon_custom_emoji_id=get_premium_id("blocked"),
     )
     builder.button(
         text=f"{get_plain_emoji('locked')} تنظیمات نجوا",
         callback_data="admin:whisper",
-        style="primary",
         icon_custom_emoji_id=get_premium_id("locked"),
     )
     # Force-join is a global gate, not a whisper setting, so it gets its own
@@ -131,7 +132,6 @@ def admin_panel_kb(*, is_root: bool = False) -> InlineKeyboardMarkup:
     builder.button(
         text=f"{get_plain_emoji('broadcast')} عضویت اجباری",
         callback_data="admin:forcejoin",
-        style="primary",
         icon_custom_emoji_id=get_premium_id("broadcast"),
     )
 
@@ -139,7 +139,6 @@ def admin_panel_kb(*, is_root: bool = False) -> InlineKeyboardMarkup:
     builder.button(
         text=f"{get_plain_emoji('chart')} گزارش سکه و رفرال",
         callback_data="admin:report",
-        style="primary",
         icon_custom_emoji_id=get_premium_id("chart"),
     )
 
@@ -156,7 +155,6 @@ def admin_panel_kb(*, is_root: bool = False) -> InlineKeyboardMarkup:
         builder.button(
             text=f"{get_plain_emoji('database')} پشتیبان‌گیری",
             callback_data="admin:backup",
-            style="primary",
             icon_custom_emoji_id=get_premium_id("database"),
         )
         builder.button(
@@ -165,6 +163,14 @@ def admin_panel_kb(*, is_root: bool = False) -> InlineKeyboardMarkup:
             style="danger",
             icon_custom_emoji_id=get_premium_id("crown"),
         )
+    # The way back to the USER side, on the panel itself. The admin panel is
+    # sent with NO reply keyboard (a panel is an inline screen), so without
+    # this row the only route back would be typing /start — and a button is
+    # worth a command any day. It also reinstalls the user reply keyboard on
+    # the way out, which an inline edit could never do.
+    builder.row(
+        _button("پنل کاربری", "admin:panel:user", "back"),
+    )
     builder.adjust(2, 2, 2, 2, 2, 1, 2)
     return builder.as_markup()
 
@@ -178,13 +184,11 @@ def admin_stats_kb() -> InlineKeyboardMarkup:
     builder.button(
         text=f"{get_plain_emoji('refresh')} به‌روزرسانی",
         callback_data="admin:stats",
-        style="primary",
         icon_custom_emoji_id=get_premium_id("refresh"),
     )
     builder.button(
         text=f"{get_plain_emoji('back')} بازگشت به منوی مدیریت",
         callback_data=BACK_TO_PANEL,
-        style="primary",
         icon_custom_emoji_id=get_premium_id("back"),
     )
     builder.adjust(2)
@@ -234,19 +238,16 @@ def admin_users_kb() -> InlineKeyboardMarkup:
     builder.button(
         text=f"{get_plain_emoji('crown')} وضعیت ویژهٔ کاربر",
         callback_data="admin:user:flags",
-        style="primary",
         icon_custom_emoji_id=get_premium_id("crown"),
     )
     builder.button(
         text=f"{get_plain_emoji('queue')} ورودی گزارش‌ها",
         callback_data="admin:reports",
-        style="primary",
         icon_custom_emoji_id=get_premium_id("queue"),
     )
     builder.button(
         text=f"{get_plain_emoji('back')} بازگشت به منوی مدیریت",
         callback_data=BACK_TO_PANEL,
-        style="primary",
         icon_custom_emoji_id=get_premium_id("back"),
     )
     builder.adjust(2, 2, 1)
@@ -286,7 +287,6 @@ def admin_user_flags_kb(
     builder.button(
         text=f"{get_plain_emoji('back')} بازگشت به مدیریت کاربران",
         callback_data="admin:users",
-        style="primary",
     )
     builder.adjust(1, 1, 1, 1)
     return builder.as_markup()
@@ -313,13 +313,11 @@ def admin_manage_admins_kb() -> InlineKeyboardMarkup:
     builder.button(
         text=f"{get_plain_emoji('users')} لیست ادمین‌ها",
         callback_data="admin:admins:list",
-        style="primary",
         icon_custom_emoji_id=get_premium_id("users"),
     )
     builder.button(
         text=f"{get_plain_emoji('back')} بازگشت به منوی مدیریت",
         callback_data=BACK_TO_PANEL,
-        style="primary",
         icon_custom_emoji_id=get_premium_id("back"),
     )
     builder.adjust(2, 1, 1)
@@ -435,8 +433,9 @@ def admin_costs_kb(policy) -> InlineKeyboardMarkup:
     """Per-service prices, each button showing what it currently costs.
 
     The value lives IN the button because that is the question the admin opened
-    this screen to answer; a paid service is ``primary`` and a free one
-    ``success``, so «which of these are free?» is answerable at a glance.
+    this screen to answer; a free service is green, a paid one stays uncoloured,
+    so «which of these are free?» is answerable at a glance without painting
+    every row a different colour.
     """
     builder = InlineKeyboardBuilder()
     for field_name, (suffix, emoji_key, label) in COST_FIELDS.items():
@@ -444,7 +443,7 @@ def admin_costs_kb(policy) -> InlineKeyboardMarkup:
         builder.button(
             text=f"{get_plain_emoji(emoji_key)} {label}: {_price(value)}",
             callback_data=f"admin:costs:edit:{suffix}",
-            style="success" if value <= 0 else "primary",
+            style="success" if value <= 0 else None,
             icon_custom_emoji_id=get_premium_id(emoji_key),
         )
     _back_button(builder)
@@ -460,7 +459,6 @@ def admin_rewards_kb(policy) -> InlineKeyboardMarkup:
         builder.button(
             text=f"{get_plain_emoji(emoji_key)} {label}: {getattr(policy, field_name, 0)}",
             callback_data=f"admin:rewards:edit:{suffix}",
-            style="primary",
             icon_custom_emoji_id=get_premium_id(emoji_key),
         )
     _back_button(builder)
@@ -488,7 +486,6 @@ def admin_limits_kb(policy) -> InlineKeyboardMarkup:
         builder.button(
             text=f"{get_plain_emoji(emoji_key)} {label}: {getattr(policy, field_name, 0)}",
             callback_data=f"admin:limits:edit:{suffix}",
-            style="primary",
             icon_custom_emoji_id=get_premium_id(emoji_key),
         )
     _back_button(builder)
@@ -536,7 +533,6 @@ def admin_report_kb() -> InlineKeyboardMarkup:
     builder.button(
         text=f"{get_plain_emoji('refresh')} به‌روزرسانی",
         callback_data="admin:report",
-        style="primary",
         icon_custom_emoji_id=get_premium_id("refresh"),
     )
     _back_button(builder)
@@ -558,7 +554,6 @@ def admin_gift_kb() -> InlineKeyboardMarkup:
     builder.button(
         text=f"{get_plain_emoji('coins')} هدیه سکه",
         callback_data="admin:gift:coins",
-        style="primary",
         icon_custom_emoji_id=get_premium_id("coins"),
     )
     builder.button(
@@ -570,7 +565,6 @@ def admin_gift_kb() -> InlineKeyboardMarkup:
     builder.button(
         text=f"{get_plain_emoji('back')} بازگشت به منوی مدیریت",
         callback_data=BACK_TO_PANEL,
-        style="primary",
         icon_custom_emoji_id=get_premium_id("back"),
     )
     builder.adjust(1, 1, 1)
@@ -594,7 +588,6 @@ def admin_gift_scope_kb(gift_type: str, user_count: int) -> InlineKeyboardMarkup
     builder.button(
         text=f"{get_plain_emoji('profile')} کاربر مشخص",
         callback_data=f"admin:gift:{gift_type}:one",
-        style="primary",
     )
     builder.button(
         text=f"{get_plain_emoji('users')} همه کاربران ({user_count} نفر)",
@@ -604,12 +597,10 @@ def admin_gift_scope_kb(gift_type: str, user_count: int) -> InlineKeyboardMarkup
     builder.button(
         text=f"{get_plain_emoji('dice')} n کاربر تصادفی",
         callback_data=f"admin:gift:{gift_type}:random",
-        style="primary",
     )
     builder.button(
         text=f"{get_plain_emoji('back')} تغییر نوع هدیه",
         callback_data="admin:gift",
-        style="primary",
     )
     builder.adjust(1, 1, 1, 1)
     return builder.as_markup()
@@ -793,9 +784,8 @@ def admin_support_kb(
     """Support inbox filter row + the way back to the panel.
 
     The two counts are shown on the buttons because the question this screen
-    answers is «how many still need me?» — and «باز» (open) is green, the
-    colour of the action that must be taken, while answered tickets are a
-    calmer blue.
+    answers is «how many still need me?» — «باز» (open) is green because it is
+    the queue that still needs an answer; the other two stay uncoloured.
     """
     builder = InlineKeyboardBuilder()
     builder.button(
@@ -806,12 +796,10 @@ def admin_support_kb(
     builder.button(
         text=f"{get_plain_emoji('check')} پاسخ‌داده‌شده ({answered_count})",
         callback_data="admin:support:list:answered:1",
-        style="primary",
     )
     builder.button(
         text=f"{get_plain_emoji('list')} همه ({total})",
         callback_data="admin:support:list:all:1",
-        style="primary",
     )
     _back_button(builder)
     builder.adjust(1, 1, 1, 1)
@@ -837,7 +825,6 @@ def admin_support_list_kb(
             InlineKeyboardButton(
                 text=label,
                 callback_data=f"admin:support:open:{ticket_id}",
-                style="primary",
             )
         )
 
@@ -877,7 +864,6 @@ def admin_support_ticket_kb(ticket_id: int, *, closed: bool) -> InlineKeyboardMa
                 "بازکردن مجدد",
                 f"admin:support:reopen:{ticket_id}",
                 "refresh",
-                style="primary",
             )
         )
     else:
@@ -886,7 +872,6 @@ def admin_support_ticket_kb(ticket_id: int, *, closed: bool) -> InlineKeyboardMa
                 "بستن تیکت",
                 f"admin:support:close:{ticket_id}",
                 "check",
-                style="primary",
             )
         )
     builder.row(_button("بازگشت به لیست", "admin:support", "back"))

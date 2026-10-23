@@ -1,4 +1,4 @@
-"""
+﻿"""
 Profile setup FSM flow, profile viewing, and blocked-users management.
 """
 
@@ -87,13 +87,24 @@ async def _profile_photo_file_id(user, bot) -> str | None:
     return None
 
 
-async def _send_profile_card(target: Message, user) -> None:
+async def _send_profile_card(
+    target: Message,
+    user,
+    *,
+    note: str | None = None,
+    reply_keyboard: bool = False,
+) -> Message:
     """Send the profile card with the «✏️ ویرایش پروفایل» button under it.
 
     Sent as a NEW message rather than edited in place: the card may carry a
     photo, and Telegram refuses to turn a photo message back into text. The
-    edit button is inline so it sits directly beneath the card while the
-    persistent reply menu stays on screen at the same time.
+    edit button is inline so it sits directly beneath the card.
+
+    ``note`` prefixes the card (used for «✅ ذخیره شد» / «لغو شد»), so a edit
+    result is ONE message instead of a status line plus a second card.
+    ``reply_keyboard=True`` attaches the main menu instead of the inline edit
+    button — necessary after a field edit, because the reply keyboard is still
+    the field's picker and only a reply markup can replace it.
     """
     caption = format_user_profile(
         telegram_id=user.telegram_id,
@@ -103,18 +114,20 @@ async def _send_profile_card(target: Message, user) -> None:
         city=user.city,
         height=user.height,
     )
+    if note:
+        caption = f"{note}\n\n{caption}"
+    markup = main_menu_kb() if reply_keyboard else profile_card_kb()
     photo_file_id = await _profile_photo_file_id(user, target.bot)
     if photo_file_id:
-        await target.answer_photo(
+        return await target.answer_photo(
             photo=photo_file_id,
             caption=caption,
             parse_mode="HTML",
-            reply_markup=profile_card_kb(),
+            reply_markup=markup,
         )
-    else:
-        await target.answer(
-            caption, parse_mode="HTML", reply_markup=profile_card_kb()
-        )
+    return await target.answer(
+        caption, parse_mode="HTML", reply_markup=markup
+    )
 
 
 # ──────────────────────────────────────────────────
@@ -240,17 +253,26 @@ async def process_city(message: Message, state: FSMContext) -> None:
 
     city = message.text
     if city == "✏️ شهر دیگر":
-        await message.answer("📝 نام شهر خود را تایپ کنید:")
+        await _edit_prompt_note(
+            message, state, "📝 نام شهر خود را تایپ کنید:", city_kb()
+        )
         return
 
     if not city or len(city) < 2:
-        await message.answer("⚠️ لطفاً نام شهر معتبر وارد کنید.")
+        await _edit_prompt_note(
+            message, state, "⚠️ لطفاً نام شهر معتبر وارد کنید.", city_kb()
+        )
         return
     # Column is String(128): past that, SQLite would happily store it and
     # PostgreSQL would reject the row with a DataError at commit time — the
     # user would see a profile that never saves for no visible reason.
     if len(city) > 128:
-        await message.answer("⚠️ نام شهر خیلی بلند است؛ حداکثر ۱۲۸ کاراکتر.")
+        await _edit_prompt_note(
+            message,
+            state,
+            "⚠️ نام شهر خیلی بلند است؛ حداکثر ۱۲۸ کاراکتر.",
+            city_kb(),
+        )
         return
 
     await state.update_data(city=city)
@@ -292,12 +314,19 @@ async def process_height(message: Message, state: FSMContext) -> None:
         return
 
     if not message.text:
-        await message.answer("⚠️ لطفاً قد خود را وارد کنید.")
+        await _edit_prompt_note(
+            message, state, "⚠️ لطفاً قد خود را وارد کنید.", height_kb()
+        )
         return
     # Column is String(32) — see the note in process_city; same DataError
     # story on PostgreSQL if a pasted paragraph gets in.
     if len(message.text) > 32:
-        await message.answer("⚠️ قد خیلی بلند است؛ حداکثر ۳۲ کاراکتر وارد کنید.")
+        await _edit_prompt_note(
+            message,
+            state,
+            "⚠️ قد خیلی بلند است؛ حداکثر ۳۲ کاراکتر وارد کنید.",
+            height_kb(),
+        )
         return
 
     # Store the height as-is (e.g. "180 سانتی‌متر" or just "180")
@@ -543,11 +572,87 @@ async def cancel_confirm(message: Message, state: FSMContext) -> None:
 # Profile Edit  («✏️ ویرایش پروفایل» — one field at a time)
 # ──────────────────────────────────────────────────
 
+#: FSM keys for the edit prompt. The prompt is a bot message that carries the
+#: field's reply keyboard, so it is deleted (not edited) when the field is done:
+#: that removes the stale picker from the screen and leaves exactly one result
+#: message (the re-rendered card).
+_PROMPT_ID = "edit_prompt_id"
+_PROMPT_CHAT = "edit_prompt_chat_id"
+
+
+async def _remember_prompt(state: FSMContext, sent: Message) -> None:
+    """Store the prompt message so the next step can remove it."""
+    await state.update_data(**{_PROMPT_ID: sent.message_id, _PROMPT_CHAT: sent.chat.id})
+
+
+async def _drop_prompt(message: Message, state: FSMContext) -> None:
+    """Delete the stored edit prompt, if any. Best effort."""
+    data = await state.get_data()
+    prompt_id = data.get(_PROMPT_ID)
+    chat_id = data.get(_PROMPT_CHAT) or message.chat.id
+    if prompt_id:
+        try:
+            await message.bot.delete_message(chat_id, prompt_id)
+        except Exception:
+            pass
+
+
+async def _edit_prompt_note(
+    message: Message,
+    state: FSMContext,
+    text: str,
+    kb,
+    *,
+    new_keyboard: bool = False,
+) -> None:
+    """Replace the prompt's own text with a validation hint (no new message).
+
+    A reply keyboard belongs to the CHAT, not to the message: editing the text
+    leaves the picker on screen untouched. That is exactly what a validation
+    hint wants (same step, same choices), so the edit is the default and the
+    ``kb`` argument is only used when there is no prompt to edit.
+
+    ``new_keyboard=True`` is for a step that genuinely hands the user a
+    DIFFERENT picker (e.g. «📷 ارسال عکس دلخواه» swapping the three photo
+    choices for the cancel-only upload keyboard). Telegram cannot change a
+    reply keyboard by editing a message, so that case deletes the old prompt
+    and sends its replacement — still one prompt on screen, never two.
+
+    If the edit/delete fails (prompt deleted by the user, too old, or a media
+    message) it falls back to a normal reply so the hint is never lost.
+    """
+    data = await state.get_data()
+    prompt_id = data.get(_PROMPT_ID)
+    chat_id = data.get(_PROMPT_CHAT) or message.chat.id
+
+    if prompt_id and not new_keyboard:
+        try:
+            await message.bot.edit_message_text(
+                text,
+                chat_id=chat_id,
+                message_id=prompt_id,
+                parse_mode="HTML",
+            )
+            return
+        except Exception:
+            pass
+    elif prompt_id:
+        try:
+            await message.bot.delete_message(chat_id, prompt_id)
+        except Exception:
+            pass
+
+    sent = await message.answer(text, reply_markup=kb)
+    # Remember the replacement so the next hint or the final card can still
+    # reuse it instead of stacking.
+    await _remember_prompt(state, sent)
+
+
 async def _finish_field_edit(message: Message, state: FSMContext, **values) -> None:
-    """Persist the edited field(s), restore the menu and re-draw the card.
+    """Persist the edited field(s) and re-draw the card in ONE message.
 
     The DB write happens inside the ``async with`` block; every Telegram call
-    (the "saved" note, the re-rendered card) happens after it closes — the same
+    (prompt deletion, the re-rendered card) happens after it closes — the same
     no-network-under-a-session rule the rest of this file follows. The returned
     ``user`` stays usable after the session closes because the factory is built
     with ``expire_on_commit=False``.
@@ -563,17 +668,47 @@ async def _finish_field_edit(message: Message, state: FSMContext, **values) -> N
                 setattr(user, field, value)
             await session.commit()
 
+    await _drop_prompt(message, state)
     await state.set_state(ChatState.idle)
-    await message.answer("✅ تغییرات ذخیره شد.", reply_markup=main_menu_kb())
+    await state.set_data({})
 
     if user is not None:
-        await _send_profile_card(message, user)
+        await _send_profile_card(
+            message,
+            user,
+            note="✅ تغییرات ذخیره شد.",
+            reply_keyboard=True,
+        )
+    else:
+        await message.answer(
+            "✅ تغییرات ذخیره شد.", reply_markup=main_menu_kb()
+        )
 
 
 async def _cancel_field_edit(message: Message, state: FSMContext) -> None:
-    """«❌ انصراف» on any edit prompt: leave the edit, restore the menu."""
+    """«❌ انصراف» on any edit prompt: step back to the profile card."""
+    data = await state.get_data()
+    await _drop_prompt(message, state)
     await state.set_state(ChatState.idle)
-    await message.answer("❌ ویرایش لغو شد.", reply_markup=main_menu_kb())
+    await state.set_data({})
+
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(User).where(User.telegram_id == message.from_user.id)
+        )
+        user = result.scalar_one_or_none()
+
+    if user is not None:
+        await _send_profile_card(
+            message,
+            user,
+            note="❌ ویرایش لغو شد.",
+            reply_keyboard=True,
+        )
+    else:
+        await message.answer(
+            "❌ ویرایش لغو شد.", reply_markup=main_menu_kb()
+        )
 
 
 @router.callback_query(F.data == "profile:edit")
@@ -585,7 +720,13 @@ async def cb_profile_edit(callback: CallbackQuery) -> None:
             text, parse_mode="HTML", reply_markup=profile_edit_kb()
         )
     except Exception:
-        # A photo card cannot be edited into text — send the picker instead.
+        # A photo card cannot be edited into text. Remove the card first, then
+        # post the picker — otherwise the user sees the old card AND a second
+        # picker message, which is exactly the duplicate-screen bug.
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
         await callback.message.answer(
             text, parse_mode="HTML", reply_markup=profile_edit_kb()
         )
@@ -609,56 +750,81 @@ async def cb_profile_edit_back(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "profile:edit:age")
 async def cb_edit_age(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(ProfileEdit.waiting_for_age)
-    await callback.message.answer(
+    sent = await callback.message.answer(
         "🎂 <b>ویرایش سن</b>\n\nسن جدید خود را انتخاب یا تایپ کنید:",
         parse_mode="HTML",
         reply_markup=age_kb(),
     )
+    await _remember_prompt(state, sent)
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
     await callback.answer()
 
 
 @router.callback_query(F.data == "profile:edit:city")
 async def cb_edit_city(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(ProfileEdit.waiting_for_city)
-    await callback.message.answer(
+    sent = await callback.message.answer(
         "🏙 <b>ویرایش شهر</b>\n\nشهر خود را انتخاب یا تایپ کنید:",
         parse_mode="HTML",
         reply_markup=city_kb(),
     )
+    await _remember_prompt(state, sent)
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
     await callback.answer()
 
 
 @router.callback_query(F.data == "profile:edit:gender")
 async def cb_edit_gender(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(ProfileEdit.waiting_for_gender)
-    await callback.message.answer(
+    sent = await callback.message.answer(
         "🚻 <b>ویرایش جنسیت</b>\n\nجنسیت خود را انتخاب کنید:",
         parse_mode="HTML",
         reply_markup=gender_kb(),
     )
+    await _remember_prompt(state, sent)
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
     await callback.answer()
 
 
 @router.callback_query(F.data == "profile:edit:height")
 async def cb_edit_height(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(ProfileEdit.waiting_for_height)
-    await callback.message.answer(
+    sent = await callback.message.answer(
         "📏 <b>ویرایش قد</b>\n\nقد خود را انتخاب یا تایپ کنید:",
         parse_mode="HTML",
         reply_markup=height_kb(),
     )
+    await _remember_prompt(state, sent)
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
     await callback.answer()
 
 
 @router.callback_query(F.data == "profile:edit:photo")
 async def cb_edit_photo(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(ProfileEdit.waiting_for_photo)
-    await callback.message.answer(
+    sent = await callback.message.answer(
         "🖼 <b>ویرایش عکس پروفایل</b>\n\n"
         "آیا مایلید عکس پروفایل شما نمایش داده شود؟",
         parse_mode="HTML",
         reply_markup=profile_photo_choice_kb(),
     )
+    await _remember_prompt(state, sent)
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
     await callback.answer()
 
 
@@ -675,7 +841,9 @@ async def edit_age(message: Message, state: FSMContext) -> None:
         or not message.text.isdigit()
         or not (16 <= int(message.text) <= 50)
     ):
-        await message.answer("⚠️ لطفاً یک عدد بین ۱۶ تا ۵۰ وارد کنید.")
+        await _edit_prompt_note(
+            message, state, "⚠️ لطفاً یک عدد بین ۱۶ تا ۵۰ وارد کنید.", age_kb()
+        )
         return
 
     await _finish_field_edit(message, state, age=int(message.text))
@@ -689,16 +857,25 @@ async def edit_city(message: Message, state: FSMContext) -> None:
 
     city = message.text
     if city == "✏️ شهر دیگر":
-        await message.answer("📝 نام شهر خود را تایپ کنید:")
+        await _edit_prompt_note(
+            message, state, "📝 نام شهر خود را تایپ کنید:", city_kb()
+        )
         return
 
     if not city or len(city) < 2:
-        await message.answer("⚠️ لطفاً نام شهر معتبر وارد کنید.")
+        await _edit_prompt_note(
+            message, state, "⚠️ لطفاً نام شهر معتبر وارد کنید.", city_kb()
+        )
         return
     # See ``process_city``: past the column width (String(128)) PostgreSQL
     # rejects the row at commit, so the length is guarded before the write.
     if len(city) > 128:
-        await message.answer("⚠️ نام شهر خیلی بلند است؛ حداکثر ۱۲۸ کاراکتر.")
+        await _edit_prompt_note(
+            message,
+            state,
+            "⚠️ نام شهر خیلی بلند است؛ حداکثر ۱۲۸ کاراکتر.",
+            city_kb(),
+        )
         return
 
     await _finish_field_edit(message, state, city=city)
@@ -712,8 +889,11 @@ async def edit_gender(message: Message, state: FSMContext) -> None:
 
     gender = GENDER_BY_LABEL.get((message.text or "").strip())
     if gender is None:
-        await message.answer(
-            "لطفاً یکی از گزینه‌ها را انتخاب کنید.", reply_markup=gender_kb()
+        await _edit_prompt_note(
+            message,
+            state,
+            "لطفاً یکی از گزینه‌ها را انتخاب کنید.",
+            gender_kb(),
         )
         return
 
@@ -727,11 +907,18 @@ async def edit_height(message: Message, state: FSMContext) -> None:
         return
 
     if not message.text:
-        await message.answer("⚠️ لطفاً قد خود را وارد کنید.")
+        await _edit_prompt_note(
+            message, state, "⚠️ لطفاً قد خود را وارد کنید.", height_kb()
+        )
         return
     # String(32) column — same DataError story as the city field.
     if len(message.text) > 32:
-        await message.answer("⚠️ قد خیلی بلند است؛ حداکثر ۳۲ کاراکتر وارد کنید.")
+        await _edit_prompt_note(
+            message,
+            state,
+            "⚠️ قد خیلی بلند است؛ حداکثر ۳۲ کاراکتر وارد کنید.",
+            height_kb(),
+        )
         return
 
     await _finish_field_edit(message, state, height=message.text)
@@ -741,10 +928,13 @@ async def edit_height(message: Message, state: FSMContext) -> None:
 async def edit_photo_last_telegram(message: Message, state: FSMContext) -> None:
     photos = await message.bot.get_user_profile_photos(message.from_user.id, limit=1)
     if not photos or photos.total_count == 0:
-        await message.answer(
+        await _edit_prompt_note(
+            message,
+            state,
             "⚠️ شما عکس پروفایلی در تلگرام ندارید.\n"
             "می‌توانید «📷 ارسال عکس دلخواه» را بزنید "
-            "یا «🙈 بدون عکس» را انتخاب کنید."
+            "یا «🙈 بدون عکس» را انتخاب کنید.",
+            profile_photo_choice_kb(),
         )
         return
 
@@ -756,10 +946,12 @@ async def edit_photo_last_telegram(message: Message, state: FSMContext) -> None:
 
 @router.message(ProfileEdit.waiting_for_photo, F.text == "📷 ارسال عکس دلخواه")
 async def edit_photo_custom(message: Message, state: FSMContext) -> None:
-    await message.answer(
+    await _edit_prompt_note(
+        message,
+        state,
         "📷 <b>عکس دلخواه خود را بفرستید:</b>",
-        parse_mode="HTML",
-        reply_markup=photo_upload_kb(),
+        photo_upload_kb(),
+        new_keyboard=True,
     )
 
 
@@ -788,9 +980,11 @@ async def edit_photo_upload(message: Message, state: FSMContext) -> None:
 @router.message(ProfileEdit.waiting_for_photo)
 async def edit_photo_invalid(message: Message, state: FSMContext) -> None:
     """Any other text on the photo step → re-show the choices, stay in state."""
-    await message.answer(
+    await _edit_prompt_note(
+        message,
+        state,
         "⚠️ لطفاً یک عکس بفرستید یا یکی از گزینه‌ها را انتخاب کنید.",
-        reply_markup=profile_photo_choice_kb(),
+        profile_photo_choice_kb(),
     )
 
 
@@ -1143,3 +1337,5 @@ async def referral(message: Message) -> None:
         parse_mode="HTML",
         reply_markup=main_menu_kb(),
     )
+
+

@@ -173,6 +173,7 @@ class _FakeBot:
 class _FakeMessage:
     def __init__(self, uid):
         self.from_user = SimpleNamespace(id=uid)
+        self.chat = SimpleNamespace(id=uid)
         self.bot = _FakeBot()
         self.answers = []
 
@@ -186,12 +187,23 @@ class _FakeMessage:
 class _FakeState:
     def __init__(self):
         self._state = None
+        self._data = {}
 
     async def set_state(self, s):
         self._state = s
 
     async def get_state(self):
         return self._state
+
+    async def get_data(self):
+        return dict(self._data)
+
+    async def set_data(self, data):
+        self._data = dict(data)
+
+    async def update_data(self, **kwargs):
+        self._data.update(kwargs)
+        return dict(self._data)
 
 
 async def db_main():
@@ -244,8 +256,12 @@ async def db_main():
     msg3 = _FakeMessage(uid)
     st3 = _FakeState()
     await hp._cancel_field_edit(msg3, st3)
-    check("cancel confirms", any("لغو شد" in a[0] for a in msg3.answers
-                                 if isinstance(a[0], str)))
+    cancel_texts = [a[0] for a in msg3.answers if isinstance(a[0], str)] + [
+        a[1].get("caption", "")
+        for a in msg3.answers
+        if isinstance(a[1], dict)
+    ]
+    check("cancel confirms", any("لغو شد" in t for t in cancel_texts))
     check("cancel returns to idle", st3._state is not None)
 
 
