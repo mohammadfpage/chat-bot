@@ -43,7 +43,6 @@ BACK_TO_MENU = "🏠 منوی اصلی"
 #: gives an unambiguous exit that works from every page it is offered on,
 #: including from inside a wizard (it drops the FSM the same way
 #: :data:`BACK_TO_MENU` does).
-CLOSE_MENU_LABEL = "❌ بستن منو"
 
 #: Everything the escape handler answers to, so the button keeps working even
 #: if Telegram or a later edit changes its exact glyphs.
@@ -163,7 +162,6 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
             ],
             [
                 KeyboardButton(text="⛔️ لیست مسدودی‌ها", style="danger"),
-                KeyboardButton(text=CLOSE_MENU_LABEL),
             ],
         ],
     )
